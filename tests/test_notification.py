@@ -198,6 +198,43 @@ def test_prompt_does_not_ask_the_agent_to_greet():
     assert not re.search(r"^open with", opening, re.M), opening[:200]
 
 
+def test_prompt_does_not_ask_the_agent_to_say_goodbye():
+    """The service speaks the sign-off; the prompt must not also order one.
+
+    Same shape as the doubled greeting, at the other end of the call. The prompt
+    said "close warmly and briefly ... then call end_call", and the dispatcher
+    then requested its own closing line - so callers heard two farewells stacked
+    on whatever had already been said after take_message.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "prompts" / "receptionist.md").read_text(encoding="utf-8")
+    ending = text.split("## Ending", 1)[1].lower()
+
+    assert "do not say goodbye yourself" in ending
+    # No instruction to compose a farewell before hanging up.
+    assert not re.search(r"close warmly|say the closing line", ending), ending[:200]
+
+
+def test_the_signoff_request_is_prescriptive():
+    """A conditional in this instruction gets read as licence for a full farewell."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    source = (root / "src" / "realtime.py").read_text(encoding="utf-8")
+    # The instruction is built from adjacent string literals across several
+    # lines, so join them before matching on the sentence it actually sends.
+    joined = re.sub(r'"\s*\n\s*"', "", source)
+
+    assert "at most eight words" in joined
+    assert "do not add a second sentence" in joined.lower()
+    # The old conditional phrasing is what produced the rambling.
+    assert "If you have already said goodbye" not in joined
+
+
 def test_greeting_carries_the_configured_locale_not_a_hardcoded_accent():
     """`response.instructions` replaces the session prompt for that response.
 
@@ -415,6 +452,48 @@ def test_summary_carries_no_markup_that_would_need_escaping():
     assert "*" not in text and "_" not in text
     # The number goes last, on its own line, so it stays tappable.
     assert text.endswith("+447700900123")
+
+
+def test_summary_prompt_demands_a_name_and_a_number():
+    """Both were emergent rather than instructed, and both drifted.
+
+    Across real calls the caller was named in 7 of 11 summaries and the number
+    appeared in 9 of 11 - the prompt asked for prose and hoped. Naming is now an
+    explicit rule, so it holds for the same reason the emoji always did.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "prompts" / "supervisor" / "summary.md").read_text(encoding="utf-8")
+
+    assert "Say who rang" in text
+    assert "known_contact_name" in text and "caller_name" in text
+    assert "Give the number" in text
+    # The spam carve-out must survive, or cold callers get a tappable number.
+    assert "spam and telesales" in text
+
+
+def test_fallback_names_a_known_contact():
+    """The local path must agree with the supervisor prompt on naming."""
+    from src.notify import format_fallback
+
+    text = format_fallback(
+        {"category": "tradesperson_admin", "known_contact_name": "Dana",
+         "reason": "Running late", "callback_number": "+447700900123"}
+    )
+    assert "Dana" in text
+    assert text.endswith("+447700900123")
+
+
+def test_fallback_flags_a_name_mismatch_rather_than_picking_one():
+    """A caller giving a different name from the saved one is worth seeing."""
+    from src.notify import format_fallback
+
+    text = format_fallback(
+        {"category": "tradesperson_admin", "caller_name": "Dave",
+         "known_contact_name": "Dana", "reason": "At the door"}
+    )
+    assert "Dave" in text and "Dana" in text
 
 
 def test_spam_summaries_omit_the_callback_number():

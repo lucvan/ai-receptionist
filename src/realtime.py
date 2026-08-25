@@ -887,9 +887,11 @@ class CallBridge:
         # caller in dead air every time the agent records a classification or takes
         # a message, which is exactly how it behaved on the first real call.
         #
-        # The one exception is end_call: the closing line was already spoken in the
-        # same turn, and asking for another response would make it talk past its own
-        # goodbye.
+        # end_call is handled separately below: the sign-off is requested here
+        # rather than left to the prompt, because the model calls end_call *before*
+        # speaking at least as often as after, and a call that drops mid-goodbye is
+        # worse than one that ends a beat late.
+        #
         # Nobody is on the line during extraction, so no follow-up turn.
         if self._extracting:
             return
@@ -897,6 +899,13 @@ class CallBridge:
         if self._ending:
             # Ask for one short sign-off. Without this the call drops the instant
             # end_call returns, cutting the agent off mid-goodbye.
+            #
+            # The instruction is deliberately prescriptive. An earlier version
+            # said "say one short closing line... if you have already said
+            # goodbye, just say 'Goodbye'", and that conditional was read as
+            # licence to produce a full farewell every time - stacked on whatever
+            # the model had already said after take_message, callers heard three
+            # variations of "thanks, I'll pass that on" in a row.
             if not self._farewell_pending:
                 self._farewell_pending = True
                 await self._send_openai(
@@ -905,9 +914,12 @@ class CallBridge:
                         "response": {
                             "tool_choice": "none",
                             "instructions": (
-                                "Say one short closing line to the caller now, then "
-                                "stop. If you have already said goodbye, just say "
-                                "'Goodbye.' Add nothing else."
+                                "End the call now with ONE short sentence of at "
+                                "most eight words, for example "
+                                '"Thanks for calling, goodbye." '
+                                "Do not thank them for anything specific, do not "
+                                "say what you will pass on, do not apologise, and "
+                                "do not add a second sentence. One line, then stop."
                             ),
                         },
                     }
