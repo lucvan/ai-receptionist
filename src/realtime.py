@@ -112,6 +112,9 @@ class CallBridge:
         self.transfer_reason = ""
         self._closed = asyncio.Event()
         self._last_activity = time.monotonic()
+        # Set when OpenAI acknowledges `session.update`. The greeting waits on
+        # this so it is spoken in the configured voice rather than the default.
+        self._session_ready = asyncio.Event()
 
         # Every tool result is followed by a request for a new response, so a model
         # that keeps calling tools without speaking could spin. Reset whenever the
@@ -134,16 +137,30 @@ class CallBridge:
             ) as openai_ws:
                 self._openai = openai_ws
                 await self._configure_session()
-                await self._greet()
+
+                # The greeting is NOT sent here. `session.update` is applied
+                # asynchronously, and a `response.create` racing ahead of it is
+                # generated with the *default* voice - the caller hears one voice
+                # say hello and another continue the conversation. Observed on a
+                # real call. `_greet_when_ready` waits for `session.updated`,
+                # which only arrives once the pump below is reading events.
+                #
+                # Deliberately not in the wait set below: it finishes in about a
+                # second, and FIRST_COMPLETED would tear the call down with it.
+                greeter = asyncio.create_task(self._greet_when_ready())
 
                 tasks = [
                     asyncio.create_task(self._pump_twilio_to_openai()),
                     asyncio.create_task(self._pump_openai_to_twilio()),
                     asyncio.create_task(self._watchdog()),
                 ]
-                _, pending = await asyncio.wait(
-                    tasks, return_when=asyncio.FIRST_COMPLETED
-                )
+                try:
+                    _, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    greeter.cancel()
+                    await asyncio.gather(greeter, return_exceptions=True)
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -301,12 +318,36 @@ class CallBridge:
 
         await self._send_openai({"type": "session.update", "session": session})
 
+    async def _greet_when_ready(self) -> None:
+        """Greet once the session config has actually been applied.
+
+        `session.update` carries the voice, and it is acknowledged asynchronously.
+        Greeting before the acknowledgement means the opening line is generated
+        with the default voice and everything after it in the configured one -
+        which a caller hears as the voice changing mid-conversation.
+
+        Bounded, because a greeting in the wrong voice still beats silence: if the
+        acknowledgement has not arrived by then, speak anyway.
+        """
+        try:
+            await asyncio.wait_for(self._session_ready.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            log.warning(
+                "call %s: session.updated did not arrive, greeting anyway",
+                self._record.call_sid,
+            )
+        await self._greet()
+
     async def _greet(self) -> None:
         """Make the agent speak first, rather than waiting for the caller.
 
         The line is given verbatim rather than left to the model's recall of the
         prompt - asked to "greet the caller", it improvises something chatty that
         never identifies who is speaking.
+
+        Note `response.instructions` *replaces* the session instructions for this
+        one response, so the delivery guidance has to be repeated here; the prompt
+        the session carries does not apply to it.
         """
         assistant = self._persona.assistant_name
         if self.is_outbound:
@@ -321,7 +362,14 @@ class CallBridge:
                 "their call from earlier, in one sentence, then wait."
             )
             await self._send_openai(
-                {"type": "response.create", "response": {"instructions": opener}}
+                {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            self._persona.locale_note + "\n\n" + opener
+                        )
+                    },
+                }
             )
             return
 
@@ -341,8 +389,9 @@ class CallBridge:
                 "type": "response.create",
                 "response": {
                     "instructions": (
-                        "Say exactly this line and nothing else, warmly and "
-                        f'unhurried, in your British accent: "{line}"'
+                        self._persona.locale_note
+                        + "\n\nSay exactly this line and nothing else, warmly "
+                        + f'and unhurried: "{line}"'
                     )
                 },
             }
@@ -434,6 +483,7 @@ class CallBridge:
 
                 elif etype == EVT_SESSION_UPDATED:
                     log.info("call %s session configured", self._record.call_sid)
+                    self._session_ready.set()
 
         except Exception as exc:  # noqa: BLE001
             log.info(

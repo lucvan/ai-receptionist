@@ -177,6 +177,59 @@ def test_shipped_prompts_use_placeholders_not_names():
         assert "{{owner_name}}" in text or "{{assistant_name}}" in text, name
 
 
+def test_prompt_does_not_ask_the_agent_to_greet():
+    """The service speaks the opening line; the prompt must not also order one.
+
+    Regression test for a real call: the prompt told the agent to "open with the
+    greeting", which it cannot see and which the service had already delivered.
+    The caller was greeted by name and then immediately greeted again with the
+    generic line.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "prompts" / "receptionist.md").read_text(encoding="utf-8")
+
+    opening = text.split("## Opening", 1)[1].split("\n## ", 1)[0].lower()
+    # It must say the greeting is already done...
+    assert "already been spoken" in opening
+    # ...and must not instruct the agent to produce one itself.
+    assert not re.search(r"^open with", opening, re.M), opening[:200]
+
+
+def test_greeting_carries_the_configured_locale_not_a_hardcoded_accent():
+    """`response.instructions` replaces the session prompt for that response.
+
+    So the delivery guidance has to be repeated in the greeting call. It used to
+    say "in your British accent" literally, which silently overrode LOCALE_NOTE
+    for the one line every caller definitely hears.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    source = (root / "src" / "realtime.py").read_text(encoding="utf-8")
+    assert "British accent" not in source
+    assert "self._persona.locale_note" in source
+
+
+def test_greeting_waits_for_the_session_to_be_applied():
+    """Guards the fix for the voice changing mid-call.
+
+    session.update is acknowledged asynchronously; a response.create that races
+    it is generated with the default voice. The greeter must wait on
+    session.updated rather than firing immediately after configure.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    source = (root / "src" / "realtime.py").read_text(encoding="utf-8")
+    assert "_session_ready" in source
+    assert "_greet_when_ready" in source
+    # configure must not be immediately followed by the greeting call again.
+    assert "await self._configure_session()\n                await self._greet()" not in source
+
+
 def test_placeholders_are_substituted():
     from src.persona import Persona, render
 
