@@ -19,3 +19,7 @@ config/contacts.json
 
 # Written by the admin UI. No secrets, but environment-specific.
 config/settings.json
+
+# Written by the setup wizard, and this one DOES hold credentials: the voice
+# provider key, Twilio, and one per notification channel. Never commit it.
+config/secrets.json

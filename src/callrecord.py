@@ -59,6 +59,13 @@ class CallRecord:
     urgency: str = "normal"
 
     # Operational.
+    # Which voice provider answered this call, and its own id for the session.
+    # Kept because the two behave differently enough that "was this an OpenAI
+    # call or an ElevenLabs one" is the first question worth asking about an odd
+    # transcript - and because the id is what looks the call up in the
+    # provider's own dashboard.
+    provider: str = ""
+    provider_conversation_id: str = ""
     end_reason: str = ""
     notify_flagged: bool = False
     notify_why: str = ""

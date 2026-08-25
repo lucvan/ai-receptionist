@@ -13,7 +13,7 @@ make is cheaper to find there.
 
 | | Why | Cost |
 |---|---|---|
-| **An OpenAI API key with Realtime access** | The agent itself | ~$0.06/min on `gpt-realtime-mini` at time of writing |
+| **A voice provider account** — *either* an OpenAI API key with Realtime access *or* an ElevenLabs API key | The agent itself | ~$0.06/min on `gpt-realtime-mini` at time of writing; ElevenLabs bills its own way |
 | **A Twilio account and a voice number** | The phone line | ~£1/month plus per-minute |
 | **Somewhere to run Docker** | A always-on box, a VPS, a Pi 5 | — |
 | **A public HTTPS hostname** | Twilio has to reach your webhook and open a WebSocket to it | — |
@@ -28,6 +28,24 @@ forwards plain HTTP will not do. Options, easiest first:
   `proxy_set_header Upgrade`/`Connection` set.
 - **ngrok** — fine for the walkthrough, but the URL changes on every restart and you
   will have to update Twilio each time.
+
+---
+
+## 0. Or skip most of this: the setup wizard
+
+Once the container is up with an `ADMIN_PASSWORD` set, `http://127.0.0.1:5051/setup`
+walks the same ground in five steps, with every list read live from your accounts
+rather than typed. It can set the voice-provider key, Twilio credentials, the
+phone number, the notification credentials, and provision the ElevenLabs agent.
+
+Three things it deliberately cannot do, because they change the security posture
+rather than a destination — set them in `.env` yourself:
+`TRANSFER_TO_NUMBER`, `VALIDATE_TWILIO_SIGNATURE`, and `ADMIN_PASSWORD` itself.
+`PUBLIC_BASE_URL` is also `.env`-only: it has to match the Twilio webhook
+character for character, and a trailing slash typed into a box breaks every call.
+
+The walkthrough below is still worth reading once — it explains *why* each piece
+is there, which the wizard does not.
 
 ---
 
@@ -200,6 +218,52 @@ caller ID is trivially spoofed.
 
 ## 4. Optional pieces
 
+### Answering with ElevenLabs instead of OpenAI
+
+`VOICE_PROVIDER=elevenlabs` swaps the voice, the turn-taking and the billing.
+Nothing else changes — same tools, same summaries, same channels, same callbacks
+and transfers.
+
+**The easy way is the setup wizard** at `http://127.0.0.1:5051/setup/voice`:
+paste a key (it is checked for the right scopes before it is stored), pick a
+voice from your account, press *Create the agent*. It runs the same code as the
+script below and verifies the result.
+
+The command line does the same thing, and is what you want on a headless box.
+An ElevenLabs agent references its tools by id, so they have to exist before the
+first call:
+
+```bash
+python scripts/elevenlabs_setup.py --check     # is the key usable?
+python scripts/elevenlabs_setup.py --voices    # list voice ids
+python scripts/elevenlabs_setup.py --dry-run   # see exactly what it will send
+python scripts/elevenlabs_setup.py             # create it, print the agent id
+python scripts/elevenlabs_setup.py --agent-id agent_x --verify   # check it
+```
+
+Then in `.env`:
+
+```bash
+VOICE_PROVIDER=elevenlabs
+ELEVENLABS_API_KEY=sk_...
+ELEVENLABS_AGENT_ID=agent_...       # printed by the script
+```
+
+Restart, and check `/health` reports `"voice_provider": "elevenlabs"`.
+
+Re-run the script with `--agent-id agent_...` whenever `src/tools.py` changes —
+the agent keeps its own copy of the tool surface and will not update itself. Add
+`--include-transfer` if `TRANSFER_ENABLED` is on; it is left out by default so an
+agent that should not be able to transfer cannot see the tool.
+
+**Make the agent private and set `ELEVENLABS_API_KEY`.** A public agent can be
+reached by anyone who learns its id, on your credits. The service warns at
+startup if the key is missing.
+
+Once it is running, voice and language are editable in the admin UI. Everything
+else about how the agent behaves — its model, its turn-taking, its knowledge base
+— lives in the ElevenLabs dashboard, because that is where the agent lives.
+
 ### A supervisor
 
 Writes better summaries than the built-in formatter, and can enrich them if it is an
@@ -272,7 +336,14 @@ opening the port.
 |---|---|
 | Every call 403s | `PUBLIC_BASE_URL` does not match the Twilio webhook exactly, or you used an API Key secret instead of the Auth Token |
 | Call connects then drops immediately | WebSocket upgrade is not passing through your proxy or tunnel |
-| Caller hears nothing | Check `OPENAI_API_KEY` has Realtime access — `curl -s -H "Authorization: Bearer $KEY" https://api.openai.com/v1/models \| grep realtime` |
+| Caller hears nothing (OpenAI) | Check `OPENAI_API_KEY` has Realtime access — `curl -s -H "Authorization: Bearer $KEY" https://api.openai.com/v1/models \| grep realtime` |
+| Caller hears loud static or noise (ElevenLabs) | The agent is not set to `ulaw_8000` both ways. It cannot be fixed per call — re-run `scripts/elevenlabs_setup.py --agent-id ...`. The logs say so explicitly at `ERROR` |
+| Agent ignores the caller's context and answers generically (ElevenLabs) | The prompt override is not allowlisted on the agent, so it is being dropped in silence and the fallback prompt is answering. Re-run the setup script |
+| Calls drop after ~20 seconds (ElevenLabs) | Pings going unanswered. The bridge handles this; if you have forked it, check the `pong` reply still carries `event_id` |
+| Nothing recorded on any call (ElevenLabs) | The client tools are missing from the agent. Run `scripts/elevenlabs_setup.py` |
+| Setup script: `English Agents must use turbo or flash v2` | `eleven_flash_v2_5` is the *multilingual* line; an agent pinned to `language: en` needs `eleven_flash_v2`. `--tts-model auto` (the default) picks correctly from `--language` |
+| Setup script: `Must set one of: description, dynamic_variable, ...` | A tool parameter has no description. ElevenLabs requires one on every property where OpenAI does not; the converter fills a fallback in, so this only appears if you have edited the script |
+| ElevenLabs key returns 401 `missing_permissions` | The key is valid but unscoped. It needs **`convai_read`** and **`convai_write`** — note the signed-URL endpoint requires `convai_write` despite being a GET |
 | `/health` says `degraded`, empty `missing_config` | No notification channel configured |
 | Summaries arrive with nothing in them | The model ended the call without calling `take_message`; the end-of-call extraction backstop should catch this — check logs for `extraction` |
 | Agent asks for a number it already has | `From` is not reaching the app; check your proxy is forwarding the POST body intact |

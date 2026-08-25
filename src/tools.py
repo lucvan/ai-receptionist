@@ -100,7 +100,10 @@ TOOL_SPECS: list[dict] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "caller_name": {"type": "string"},
+                "caller_name": {
+                    "type": "string",
+                    "description": "The caller's name, as they gave it.",
+                },
                 "company_or_relationship": {
                     "type": "string",
                     "description": "Company name, or how they say they know the owner.",

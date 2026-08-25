@@ -42,12 +42,20 @@ over prompt instructions when the stakes are real.
 ```
 src/
   server.py         HTTP + WebSocket surface, and the wiring of everything else
-  realtime.py       one call, answer to hangup: audio pumps, tool dispatch, barge-in
+  bridge.py         one call, answer to hangup, minus the provider wire format:
+                    Twilio pumps, playback bookkeeping, tool dispatch, call guards
+  realtime.py       the OpenAI Realtime half of a bridge
+  elevenlabs.py     the ElevenLabs Agents half of a bridge
   tools.py          the complete tool surface — this file IS the privilege boundary
   callrecord.py     the only thing kept about a call
   persona.py        whose calls this answers; prompt placeholder rendering
   config.py         env baseline
   settings.py       the UI-writable overlay on top of it, and the live-config proxy
+  secrets_store.py  write-only credential overlay — read its docstring before
+                    widening what the UI may set
+  catalogs.py       asks OpenAI/Twilio what they offer, so dropdowns are not guesses
+  elevenlabs_provision.py  creating the agent + tools; shared by CLI and wizard
+  wizard.py         the five-step setup flow at /setup
   supervisor.py     optional: any OpenAI-compatible endpoint that writes summaries
   notify.py         delivery: Telegram, email, webhook, WhatsApp, plus routing
   whatsapp.py       bridge adapters and QR pairing
@@ -59,8 +67,15 @@ src/
   twilio_auth.py    signature validation and per-call stream tokens
   admin.py          the admin UI
 prompts/            bind-mounted, re-read per call, placeholder-templated
+scripts/            elevenlabs_setup.py — provisions the agent; stdlib only
 tests/              pytest, no network
 ```
+
+If you are adding a voice provider, subclass `BaseBridge` and implement its five
+hooks. Anything you find yourself wanting to duplicate into the subclass probably
+belongs in `bridge.py` instead — the test
+`test_the_two_bridges_are_interchangeable_from_the_server_s_point_of_view` exists
+to catch the case where the two drift apart.
 
 Start with `server.py`. It is the assembly point and reading it top to bottom tells
 you what exists.
@@ -112,6 +127,23 @@ caller ID and the saved contact book both outrank the agent's transcription;
 more digits away is treated as genuinely different and honoured, because quietly
 redirecting a call to the wrong person is worse than failing to fix a typo.
 
+**Credentials the UI can set are write-only, and that is load-bearing.** A value
+that goes into `config/secrets.json` never comes back out of any page — the boxes
+always render empty. That is what makes UI-settable credentials defensible: a
+stolen admin session can *replace* a key, which is loud and recoverable, but
+cannot *read* one, which would be silent and permanent. A blank field therefore
+means "keep", never "clear". Before adding a key to `SECRET_KEYS`, read the
+docstring in `secrets_store.py` — the things that stayed in `.env` stayed there
+for a reason, and `TRANSFER_TO_NUMBER` is the sharpest of them.
+
+**Dropdowns are built from the account, not from a literal.** `catalogs.py` and
+`elevenlabs_provision.py` ask each provider what it offers. A hardcoded list is
+wrong the moment a vendor ships something and wrong *silently* — the first draft
+of the wizard offered two OpenAI realtime models against an account that had
+eight. The lists in `settings.CHOICES` are fallbacks for the pre-credential
+state, not the source of truth. OpenAI's voice list is the one genuine exception:
+there is no endpoint for it anywhere.
+
 **Only one process may long-poll a Telegram bot token.** Two pollers get updates
 handed out alternately and both behave erratically. If your supervisor also speaks
 Telegram, turn its Telegram platform off.
@@ -129,8 +161,15 @@ The tests need no network, no Twilio, no OpenAI, and no SMTP server. They run in
 about a second. There is no excuse for not running them.
 
 What is covered: the settings/env resolution, channel selection, routing, the
-WhatsApp request shapes and template escaping, and the admin settings page including
-the assertion that **no secret ever reaches `settings.json`**.
+WhatsApp request shapes and template escaping, both call bridges' wire protocols,
+provider selection, the provider catalogues, and the admin/wizard pages —
+including the assertion that **no secret ever reaches `settings.json`** and that
+**no page ever renders a stored credential**.
+
+The wizard tests stub every provider lookup through an autouse fixture. That is
+not optional politeness: the wizard builds its dropdowns by asking the live
+account what it offers, so an unstubbed test would be slow, flaky, dependent on
+somebody's credentials, and able to spend money.
 
 What is **not** covered yet, and is the most valuable thing you could add: signature
 validation, stream token minting and verification, `resolved_callback()`, and

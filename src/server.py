@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .admin import build_admin_app
+from .bridge import BaseBridge
 from .callrecord import CallRecord, append_record
 from .config import config
 from .contacts import ContactBook
@@ -24,6 +25,7 @@ from .history import CallHistory
 from .notify import NotifierSet, format_fallback
 from .outbound import OutboundCaller
 from .pending import CallbackStore, PendingCall, PendingStore
+from .elevenlabs import ElevenLabsBridge
 from .persona import Persona, render
 from .realtime import CallBridge
 from .supervisor import SupervisorClient
@@ -105,6 +107,33 @@ callbacks = CallbackStore(config.log_dir / "pending-callbacks.json")
 transfers = CallbackStore(config.log_dir / "pending-transfers.json")
 
 
+# Which bridge answers the phone. Both take the same arguments and return the
+# same CallRecord, so this is the only place in the service that knows there is
+# more than one - everything downstream reads a record and cannot tell.
+BRIDGES: dict[str, type[BaseBridge]] = {
+    "openai": CallBridge,
+    "elevenlabs": ElevenLabsBridge,
+}
+
+
+def bridge_class() -> type[BaseBridge]:
+    """The configured bridge, falling back to OpenAI on an unknown name.
+
+    A typo in VOICE_PROVIDER should not stop the phone being answered - the
+    fallback is the provider this service shipped with, and it is loud about
+    having made the choice.
+    """
+    chosen = BRIDGES.get(config.voice_provider)
+    if chosen is None:
+        log.error(
+            "unknown VOICE_PROVIDER %r - falling back to openai. Valid values: %s",
+            config.voice_provider,
+            ", ".join(sorted(BRIDGES)),
+        )
+        return CallBridge
+    return chosen
+
+
 def load_instructions(path: Path = PROMPT_PATH) -> str:
     """Read and render the prompt fresh each call.
 
@@ -137,7 +166,18 @@ async def _startup() -> None:
     if missing:
         log.warning("not ready to take calls, missing: %s", ", ".join(missing))
     else:
-        log.info("ready, model=%s", config.openai_realtime_model)
+        log.info(
+            "ready, provider=%s model=%s",
+            bridge_class().provider_name,
+            config.voice_model,
+        )
+    if config.voice_provider == "elevenlabs" and not config.elevenlabs_api_key:
+        # Reachable only if the agent is public, which means anyone with the id
+        # can talk to it and spend the account's credits.
+        log.warning(
+            "ELEVENLABS_API_KEY is not set - the agent must be public to answer. "
+            "Set a key and make the agent private before taking real calls."
+        )
     log.info("supervisor bridge %s", "enabled" if supervisor.enabled else "disabled")
 
     channels = sorted(notifier.channels())
@@ -193,6 +233,10 @@ def _start_admin() -> None:
         country_code=config.contacts_country_code,
         cfg=config,
         notifier=notifier,
+        # Write-only credential store behind the setup wizard. Passed explicitly
+        # rather than reached through `config`, so the one component that can
+        # write credentials is visible here at the assembly point.
+        secrets=config.secrets,
     )
     server = uvicorn.Server(
         uvicorn.Config(
@@ -231,7 +275,8 @@ async def health() -> JSONResponse:
         {
             "status": "ok" if not missing and channels else "degraded",
             "service": "ai-receptionist",
-            "model": config.openai_realtime_model,
+            "voice_provider": bridge_class().provider_name,
+            "model": config.voice_model,
             "supervisor": "enabled" if supervisor.enabled else "disabled",
             "transcript_retention": config.retain_transcripts,
             "contacts_loaded": len(contacts),
@@ -564,10 +609,12 @@ async def media_stream(websocket: WebSocket) -> None:
         await websocket.close(code=1008)
         return
 
+    chosen = bridge_class()
     record = CallRecord(
         call_sid=call_sid,
         from_number=custom.get("from", ""),
         to_number=custom.get("to", ""),
+        provider=chosen.provider_name,
     )
 
     if callback:
@@ -622,7 +669,7 @@ async def media_stream(websocket: WebSocket) -> None:
         if caller_history:
             log.info("call %s: caller has rung before", call_sid)
 
-    bridge = CallBridge(
+    bridge = chosen(
         twilio_ws=websocket,
         record=record,
         cfg=config,

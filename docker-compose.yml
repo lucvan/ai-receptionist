@@ -1,7 +1,7 @@
 services:
   ai-receptionist:
     build: .
-    image: ai-receptionist:0.1.0
+    image: ai-receptionist:0.2.0
     container_name: ai-receptionist
     restart: unless-stopped
     env_file: .env
@@ -21,9 +21,11 @@ services:
       # Prompt is mounted rather than baked in, so wording can be tuned and picked
       # up on the next call without a rebuild.
       - ./prompts:/app/prompts:ro
-      # Caller recognition, re-read whenever it changes on disk, so adding a
-      # contact takes effect on the next call with no restart. Writable since the
-      # admin UI edits it; the container's root filesystem stays read-only.
+      # Caller recognition, settings, and the setup wizard's credential file,
+      # all re-read whenever they change on disk so an edit takes effect on the
+      # next call with no restart. Writable since the admin UI edits them; the
+      # container's root filesystem stays read-only. Note this directory now
+      # holds secrets.json — back it up like a credential, not like config.
       - ./config:/app/config:rw
       - ./logs:/app/logs:rw
     # Deliberately absent, and must stay absent: the Docker socket, any notes or

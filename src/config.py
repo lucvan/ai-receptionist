@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .secrets_store import SecretStore
 from .settings import LiveConfig, Settings
 
 
@@ -39,6 +40,23 @@ class Config:
         default_factory=lambda: Path(os.environ.get("LOG_DIR", "/app/logs"))
     )
 
+    # --- Voice provider ------------------------------------------------------
+    # Which service actually answers the phone: "openai" (Realtime) or
+    # "elevenlabs" (Agents). Everything downstream of the call - the tools, the
+    # record, the supervisor, the notification channels, callbacks, transfers -
+    # is identical either way, so this is a swap of the voice, the turn-taking
+    # and the billing, not of what the receptionist does.
+    #
+    # Settable from the setup wizard, but only to a provider whose credentials
+    # are already in place - the UI will not offer one that cannot answer a call.
+    # That guard is the whole reason this is safe to expose: the risk was never
+    # the swap itself, it was swapping to something unconfigured.
+    voice_provider: str = field(
+        default_factory=lambda: os.environ.get("VOICE_PROVIDER", "openai")
+        .strip()
+        .lower()
+    )
+
     # --- OpenAI --------------------------------------------------------------
     openai_api_key: str = field(
         default_factory=lambda: os.environ.get("OPENAI_API_KEY", "")
@@ -63,6 +81,31 @@ class Config:
         default_factory=lambda: os.environ.get(
             "GREETING", "Hello, you've reached the assistant — who am I speaking to?"
         )
+    )
+
+    # --- ElevenLabs ----------------------------------------------------------
+    # Unlike a Realtime session, an ElevenLabs agent is a persistent object that
+    # already carries its prompt, voice, LLM, turn-taking and - crucially - its
+    # tools. This service overrides the prompt and the opening line per call and
+    # leaves the rest to the agent, so most of the tuning that lives in env vars
+    # for OpenAI lives in the ElevenLabs dashboard instead.
+    #
+    # `scripts/elevenlabs_setup.py` creates a correctly configured agent,
+    # including the client tools and the override allowlist, and prints the id.
+    # The admin UI's setup wizard runs the same code and writes the result here.
+    elevenlabs_api_key: str = field(  # secret: env, or set write-only from the setup wizard
+        default_factory=lambda: os.environ.get("ELEVENLABS_API_KEY", "")
+    )
+    elevenlabs_agent_id: str = field(
+        default_factory=lambda: os.environ.get("ELEVENLABS_AGENT_ID", "")
+    )
+    # Optional per-call overrides. Empty means "whatever the agent is set to",
+    # which is the sane default: the agent is the source of truth for its voice.
+    elevenlabs_voice_id: str = field(
+        default_factory=lambda: os.environ.get("ELEVENLABS_VOICE_ID", "")
+    )
+    elevenlabs_language: str = field(
+        default_factory=lambda: os.environ.get("ELEVENLABS_LANGUAGE", "")
     )
 
     # --- Twilio --------------------------------------------------------------
@@ -147,6 +190,15 @@ class Config:
             os.environ.get("SETTINGS_PATH", "/app/config/settings.json")
         )
     )
+    # Credentials the setup wizard writes. Separate file from settings.json so
+    # that one stays safe to read, diff and paste into a bug report. Written
+    # 0600; see secrets_store.py for why this exists and what it deliberately
+    # does not cover.
+    secrets_path: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("SECRETS_PATH", "/app/config/secrets.json")
+        )
+    )
 
     # --- Notification --------------------------------------------------------
     # Every value here is a *default*, overridable per channel from the admin UI
@@ -155,7 +207,7 @@ class Config:
     #
     # A bot dedicated to the receptionist, sending to one fixed chat. The
     # supervisor writes the summary; these are only delivery mechanisms.
-    telegram_bot_token: str = field(  # secret, env only
+    telegram_bot_token: str = field(  # secret: env, or set write-only from the setup wizard
         default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", "")
     )
     telegram_chat_id: str = field(
@@ -168,7 +220,7 @@ class Config:
     smtp_username: str = field(
         default_factory=lambda: os.environ.get("SMTP_USERNAME", "")
     )
-    smtp_password: str = field(  # secret, env only
+    smtp_password: str = field(  # secret: env, or set write-only from the setup wizard
         default_factory=lambda: os.environ.get("SMTP_PASSWORD", "")
     )
     smtp_sender: str = field(default_factory=lambda: os.environ.get("SMTP_SENDER", ""))
@@ -179,7 +231,7 @@ class Config:
     # anything else without an adapter per service.
     webhook_url: str = field(default_factory=lambda: os.environ.get("WEBHOOK_URL", ""))
     # "Header-Name: value", e.g. "Authorization: Bearer abc123".
-    webhook_auth_header: str = field(  # secret, env only
+    webhook_auth_header: str = field(  # secret: env, or set write-only from the setup wizard
         default_factory=lambda: os.environ.get("WEBHOOK_AUTH_HEADER", "")
     )
 
@@ -188,7 +240,7 @@ class Config:
     whatsapp_bridge_url: str = field(
         default_factory=lambda: os.environ.get("WHATSAPP_BRIDGE_URL", "")
     )
-    whatsapp_bridge_key: str = field(  # secret, env only
+    whatsapp_bridge_key: str = field(  # secret: env, or set write-only from the setup wizard
         default_factory=lambda: os.environ.get("WHATSAPP_BRIDGE_KEY", "")
     )
     whatsapp_flavour: str = field(
@@ -283,6 +335,40 @@ class Config:
         default_factory=lambda: _bool("RETAIN_TRANSCRIPTS", False)
     )
 
+    def provider_ready(self, name: str) -> tuple[bool, str]:
+        """Could this provider answer a call right now? (ok, what is missing).
+
+        The wizard uses this to decide whether a provider may be *selected* at
+        all. Switching to one that has no credentials would leave the next real
+        caller hearing "this number is not available", and that failure happens
+        on someone else's phone rather than on the settings page - which is
+        exactly the sort of thing a UI should refuse rather than allow and warn
+        about.
+        """
+        if name == "elevenlabs":
+            if not self.elevenlabs_agent_id:
+                return False, "no agent yet - run the setup wizard"
+            if not self.elevenlabs_api_key:
+                return False, "no API key"
+            return True, ""
+        if name == "openai":
+            if not self.openai_api_key:
+                return False, "no API key"
+            return True, ""
+        return False, "unknown provider"
+
+    @property
+    def voice_model(self) -> str:
+        """What is actually answering the phone, for logs and `/health`.
+
+        One string rather than a provider field and a model field, because the
+        two providers do not name the same thing: OpenAI has a model id, and an
+        ElevenLabs deployment has an agent whose model is its own business.
+        """
+        if self.voice_provider == "elevenlabs":
+            return f"elevenlabs:{self.elevenlabs_agent_id or 'unset'}"
+        return self.openai_realtime_model
+
     @property
     def wss_stream_url(self) -> str:
         base = self.public_base_url
@@ -307,7 +393,14 @@ class Config:
         but "will anyone hear about this call".
         """
         missing = []
-        if not self.openai_api_key:
+        if self.voice_provider == "elevenlabs":
+            # The API key is not listed: an agent set to public can be reached
+            # without one, which is a legitimate (if short-lived) state while
+            # someone is proving the plumbing works. The agent id is not
+            # optional - there is nothing to connect to without it.
+            if not self.elevenlabs_agent_id:
+                missing.append("ELEVENLABS_AGENT_ID")
+        elif not self.openai_api_key:
             missing.append("OPENAI_API_KEY")
         if not self.public_base_url:
             missing.append("PUBLIC_BASE_URL")
@@ -323,4 +416,5 @@ class Config:
 # value without knowing a settings file exists.
 _base = Config()
 settings = Settings(_base.settings_path)
-config = LiveConfig(_base, settings)
+secrets = SecretStore(_base.secrets_path)
+config = LiveConfig(_base, settings, secrets)

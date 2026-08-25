@@ -18,10 +18,14 @@ privileged component in the system.
 ```
 caller → Twilio number → POST /incoming-call  (signature-checked)
                        → WSS /media-stream    (per-call token)
-                       → OpenAI Realtime (g711 μ-law, both directions)
+                       → OpenAI Realtime  ─┐  (g711 μ-law, both directions)
+                         or ElevenLabs    ─┘
                        → structured summary → supervisor (optional)
                                              → Telegram / email / webhook / WhatsApp
 ```
+
+Either voice provider answers the phone; everything after it is the same code.
+See [Voice provider](#voice-provider).
 
 The supervisor is any endpoint that speaks the OpenAI chat-completions API —
 OpenAI itself, a local Ollama or vLLM, a gateway like LiteLLM or OpenRouter, or
@@ -35,9 +39,10 @@ This is the part to re-read before changing anything.
 
 The container has **no** access to: any notes or document store, agent profile
 data or memory, home automation, the Docker socket, the LAN, any host path
-outside its own directory, or any shell/admin API. It holds an OpenAI key, a
-Twilio auth token, a bearer key for the supervisor endpoint, and one credential
-per notification channel you enable — nothing else.
+outside its own directory, or any shell/admin API. It holds one voice-provider
+key (OpenAI or ElevenLabs, depending on `VOICE_PROVIDER`), a Twilio auth token, a
+bearer key for the supervisor endpoint, and one credential per notification
+channel you enable — nothing else.
 
 **Composition and delivery are split on purpose.** The supervisor is the side
 with the context to write a useful summary, so it writes one; but it is also the
@@ -78,10 +83,12 @@ One JSON line per call in `logs/calls-YYYY-MM.jsonl`, holding only: caller name,
 company/relationship, callback number, reason, requested action, urgency,
 category, a short summary, and call metadata.
 
-**Full transcripts are not retained.** `RETAIN_TRANSCRIPTS` defaults to false, and
-when it is false the service does not even ask OpenAI for transcription — caller
-audio is never sent to a second model. Turning it on is a policy decision, not a
-config tweak.
+**Full transcripts are not retained.** `RETAIN_TRANSCRIPTS` defaults to false. On
+OpenAI the service does not even ask for transcription when it is off, so caller
+audio is never sent to a second model. On ElevenLabs the transcript arrives
+unasked as part of the conversation stream — it is discarded rather than written.
+Turning retention on is a policy decision, not a config tweak, and the fact that
+one provider gives it away free does not change that.
 
 Phone numbers are partially redacted in container logs (`+44...000`). Secrets are
 never logged — note that `httpx` request logging is forced to WARNING, because the
@@ -198,8 +205,8 @@ its own check:
    it before opening anything upstream.
 
 Without step 2, anyone who learned the hostname could open a media socket and burn
-OpenAI credit. Tokens for a different call, forged tokens, and expired tokens are
-all rejected with close code 1008.
+your voice-provider credit. Tokens for a different call, forged tokens, and
+expired tokens are all rejected with close code 1008.
 
 The signature is computed against `PUBLIC_BASE_URL`, not against the URL the app
 sees. Behind the reverse proxy those differ, and rebuilding from the request would
@@ -221,6 +228,128 @@ The two that are easy to get wrong:
 While anything required is missing, `/health` reports `degraded` and lists the
 missing names, and inbound calls get a polite unavailable message instead of
 connecting.
+
+## Setup wizard
+
+`http://127.0.0.1:5051/setup` — five steps from a clean install to a phone that
+answers, without editing a dotfile.
+
+Two principles run through it:
+
+**Every list is read from the account, not hardcoded.** ElevenLabs voices and
+agents, OpenAI Realtime models, Twilio phone numbers — all fetched live, so a
+model the vendor shipped yesterday is in the dropdown today. This is not
+theoretical: the first draft offered two OpenAI models from a literal, against an
+account that had eight. The one exception is the OpenAI *voice* list, which has
+no endpoint anywhere and is maintained by hand; the UI says so rather than
+implying otherwise.
+
+**Anything with a knowable set is a dropdown.** A mistyped voice name or phone
+number does not fail on the settings page — it fails on a live call, days later,
+as a caller hearing silence. Fetching the list doubles as a credential check, so
+"this key has no ConvAI permissions" or "this account has no Realtime access" is
+said at setup time.
+
+| Step | What it does |
+|---|---|
+| Identity | Who the receptionist answers for — fills the prompt placeholders |
+| Voice | Provider, key, voice, and the **ElevenLabs provisioning button** |
+| Phone line | Twilio credentials, checked; number picked from your account |
+| Notifications | Credentials for the delivery channels |
+| Finish | Live readiness check, and a generator for the media-signing key |
+
+### Credentials in the UI, and the line that did not move
+
+The wizard writes credentials to `config/secrets.json` (gitignored, mode 0600).
+They are **write-only**: a value that goes in never comes back out, on any page.
+So a stolen admin session can *replace* a key — loud, and recoverable by setting
+it again — but cannot *read* one, which would be silent and permanent.
+
+What stayed in `.env`, deliberately, is everything whose misuse changes the
+**security posture** rather than a destination:
+
+| Env-only | Why |
+|---|---|
+| `ADMIN_PASSWORD` | a session must not be able to change its own lock |
+| `VALIDATE_TWILIO_SIGNATURE` | turning it off opens the webhook to anyone |
+| `TRANSFER_ENABLED` / `TRANSFER_TO_NUMBER` | retargeting where a caller is patched through is phone fraud |
+| `CALLBACKS_ENABLED` | spends money and rings real people |
+| `RETAIN_TRANSCRIPTS` | a retention policy, not a setting |
+
+`STREAM_TOKEN_SECRET` is a half-exception: the wizard can *generate* one, but
+there is no box to type one into — nobody should be inventing that value by hand.
+
+A deployment configured entirely through `.env` is unaffected by any of this: the
+overlay only applies where a value has actually been set.
+
+## Voice provider
+
+`VOICE_PROVIDER` picks what answers the phone: `openai` (Realtime) or
+`elevenlabs` (Agents). Both speak G.711 μ-law at 8 kHz, so audio is relayed to
+Twilio without transcoding either way.
+
+Everything downstream is the same code: the same five tools, the same
+`CallRecord`, the same supervisor, notification channels, routing, caller
+history, callbacks and transfers. `src/bridge.py` holds all of it; the two
+providers differ only in wire format.
+
+|  | OpenAI Realtime | ElevenLabs Agents |
+|---|---|---|
+| Tools | sent per session, from `tools.py` | **provisioned on the agent first** |
+| Prompt | per session | per call, but must be **allowlisted** on the agent |
+| Turn-taking / barge-in | ours to enforce | server-side |
+| Opening line | a forced first turn | `first_message` config |
+| After a tool result | must ask for the next turn | continues by itself |
+| Where you tune it | `.env` + admin UI | the ElevenLabs dashboard |
+
+### ElevenLabs needs provisioning before the first call
+
+A Realtime session is handed its tool list at connect time. An ElevenLabs agent
+cannot be: tools are workspace objects the agent references by id. So three
+things have to be right on the agent *before* it can take a call, and all three
+fail quietly when they are not:
+
+| Wrong | What you hear |
+|---|---|
+| Tools missing | A perfectly normal call that records nothing. The notification says a call happened and nothing else. |
+| Overrides not allowlisted | The agent answers with its stored prompt and none of the call's context — it reads like a bad model, not a bad config. |
+| Audio not `ulaw_8000` both ways | White noise. |
+
+`scripts/elevenlabs_setup.py` sets all three and prints the agent id:
+
+```bash
+python scripts/elevenlabs_setup.py --dry-run   # see exactly what it will send
+python scripts/elevenlabs_setup.py             # create it
+python scripts/elevenlabs_setup.py --agent-id agent_xxx   # re-run after editing tools.py
+```
+
+Stdlib only, so it runs before the container exists. Re-run it whenever
+`src/tools.py` changes — the agent's copy of the tool surface does not update
+itself.
+
+Two things it deliberately does *not* do. It leaves `transfer_call` out unless
+you pass `--include-transfer`, matching the runtime rule that an agent which
+cannot see the tool cannot be talked into using it. And it gives the agent a
+working fallback prompt rather than a stub, so a dropped override degrades to a
+generic-but-safe receptionist instead of an agent improvising with no
+instructions on an open line.
+
+### The two caveats worth knowing
+
+**Post-hangup message recovery works differently.** When the agent hangs up
+without having called `take_message`, both bridges go back and ask for it rather
+than sending a notification that says only "a call happened". OpenAI can be made
+to answer with a forced tool call. ElevenLabs has no equivalent, so the bridge
+injects a text turn instead — which means a *retained* transcript ends with a
+line the caller never said. It is prefixed `[system, not spoken by the caller]`
+to make that unmistakable. The reply also generates speech into a closed socket:
+a few seconds of TTS spent to turn an empty notification into a useful one.
+
+**Transcripts are free on ElevenLabs and still not kept.** It sends both sides of
+the conversation as text at no extra cost, where OpenAI needs a second model
+billed separately. They are still discarded unless `RETAIN_TRANSCRIPTS=true` —
+see [Data minimisation](#data-minimisation). Cheap to collect is not a reason to
+keep.
 
 ## Lifecycle
 

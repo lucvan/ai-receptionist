@@ -1,20 +1,25 @@
-"""The live call bridge: Twilio Media Streams <-> OpenAI Realtime.
+"""The live call bridge for OpenAI Realtime: Twilio Media Streams <-> OpenAI.
 
 Both sides carry G.711 u-law at 8 kHz, so audio is passed through as opaque base64
 without any transcoding - we only ever move frames, never decode them.
 
-The fiddly part is barge-in. Twilio buffers whatever we send it, so when the caller
-starts talking over the agent there is already queued audio that will keep playing.
-Handling it needs three things to happen together: tell OpenAI to truncate the item
-at the point the caller actually heard, tell Twilio to drop its buffer, and reset
-our own playback bookkeeping. Miss any one and the agent talks over the caller or
-loses its place in the conversation.
+Everything that is not specific to OpenAI's wire format lives in `bridge.py`;
+read that first. What is left here is the shape of this particular API, and it
+has three habits worth knowing about before changing anything:
+
+- **Session configuration is applied asynchronously.** A `response.create` that
+  races ahead of `session.updated` is generated with the default voice.
+- **The model does not continue after a tool result.** The turn is over until we
+  explicitly ask for a new response, so every tool result is followed by one.
+- **Turn-taking is ours to enforce.** Server VAD tells us the caller started
+  talking; truncating the item they stopped hearing is on us.
+
+ElevenLabs, in `elevenlabs.py`, does the opposite of all three.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import time
@@ -23,9 +28,7 @@ from typing import Any
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from .callrecord import CallRecord
-from .config import Config
-from .persona import Persona
+from .bridge import EXTRACT_INSTRUCTION, WRAP_UP_INSTRUCTION, BaseBridge
 from .tools import tool_specs
 
 log = logging.getLogger(__name__)
@@ -43,8 +46,6 @@ EVT_SESSION_UPDATED = "session.updated"
 EVT_ERROR = "error"
 EVT_INPUT_TRANSCRIPT = "conversation.item.input_audio_transcription.completed"
 
-FINAL_MARK = "receptionist-final"
-
 # Ceiling on back-to-back tool calls between caller turns, to bound a tool loop.
 # The model legitimately chains classify_call -> take_message -> flag_urgent ->
 # end_call, so this has to sit comfortably above four: cutting a real chain short
@@ -52,229 +53,39 @@ FINAL_MARK = "receptionist-final"
 MAX_TOOL_TURNS_PER_CALLER_TURN = 8
 
 
-class CallBridge:
-    """Owns one phone call from answer to hangup."""
+class CallBridge(BaseBridge):
+    """One phone call, answered by an OpenAI Realtime session."""
 
-    def __init__(
-        self,
-        twilio_ws: Any,
-        record: CallRecord,
-        cfg: Config,
-        instructions: str,
-        caller_history: str = "",
-        stream_sid: str = "",
-        outbound_script: str = "",
-        outbound_to_name: str = "",
-        persona: Persona | None = None,
-    ):
-        self._twilio = twilio_ws
-        self._cfg = cfg
-        # Who this receptionist works for. Used only to fill in the context the
-        # service assembles around the prompt; the prompt itself is rendered
-        # before it gets here.
-        self._persona = persona or Persona.from_env()
-        self._record = record
-        self._instructions = instructions
-        # Pre-rendered summary of this number's previous calls, or "" for a first
-        # -time caller. A finished string, deliberately: see server.py.
-        self._caller_history = caller_history
-        # Set only for callbacks: the message to relay, and who to.
-        # Empty on an inbound call, which is what distinguishes the two modes.
-        self._outbound_script = outbound_script
-        self._outbound_to_name = outbound_to_name
+    provider_name = "openai"
 
-        self._openai: ClientConnection | None = None
-        # Known up front: the server reads Twilio's `start` frame to authenticate
-        # the stream before handing the socket over.
-        self._stream_sid: str = stream_sid
-        self._started = time.monotonic()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-        # Playback bookkeeping, all in Twilio's media-timestamp milliseconds.
-        self._latest_media_ts: int = 0
-        self._response_start_ts: int | None = None
+        # Needed to truncate the right item on barge-in: OpenAI wants the id of
+        # the assistant message the caller talked over.
         self._last_assistant_item: str | None = None
-        self._mark_queue: list[str] = []
-
-        self._ending = False
         # end_call arrives *before* the model has said goodbye as often as after, so
         # we always request one explicit closing line and hang up when it finishes.
         self._farewell_pending = False
-        # True only during end-of-call extraction, when the caller has already gone
-        # and there is nobody left to speak to.
-        self._extracting = False
         # A response can still be generating when the caller hangs up. Creating
         # another one while it is in flight is rejected outright, which is how the
         # end-of-call extraction silently recovered nothing.
         self._response_active = False
-        # Set when the agent asks to put the caller through. The bridge then stops
-        # driving the call and hands control to Twilio's <Dial>.
-        self.transfer_requested = False
-        self.transfer_reason = ""
-        self._closed = asyncio.Event()
-        self._last_activity = time.monotonic()
-        # Set when OpenAI acknowledges `session.update`. The greeting waits on
-        # this so it is spoken in the configured voice rather than the default.
-        self._session_ready = asyncio.Event()
-
         # Every tool result is followed by a request for a new response, so a model
         # that keeps calling tools without speaking could spin. Reset whenever the
         # caller talks; a burst larger than this is a loop, not a conversation.
         self._tool_turns_since_caller = 0
 
-        # Loop detection: caller turns taken, and whether we have already nudged.
-        self._caller_turns = 0
-        self._nudged_wrap_up = False
+    @property
+    def _openai(self) -> ClientConnection | None:
+        return self._provider
 
-    # -- lifecycle ---------------------------------------------------------
+    # -- session -----------------------------------------------------------
 
-    async def run(self) -> CallRecord:
+    async def _open_provider(self) -> Any:
         headers = {"Authorization": f"Bearer {self._cfg.openai_api_key}"}
         url = f"{OPENAI_REALTIME_URL}?model={self._cfg.openai_realtime_model}"
-
-        try:
-            async with websockets.connect(
-                url, additional_headers=headers, max_size=None
-            ) as openai_ws:
-                self._openai = openai_ws
-                await self._configure_session()
-
-                # The greeting is NOT sent here. `session.update` is applied
-                # asynchronously, and a `response.create` racing ahead of it is
-                # generated with the *default* voice - the caller hears one voice
-                # say hello and another continue the conversation. Observed on a
-                # real call. `_greet_when_ready` waits for `session.updated`,
-                # which only arrives once the pump below is reading events.
-                #
-                # Deliberately not in the wait set below: it finishes in about a
-                # second, and FIRST_COMPLETED would tear the call down with it.
-                greeter = asyncio.create_task(self._greet_when_ready())
-
-                tasks = [
-                    asyncio.create_task(self._pump_twilio_to_openai()),
-                    asyncio.create_task(self._pump_openai_to_twilio()),
-                    asyncio.create_task(self._watchdog()),
-                ]
-                try:
-                    _, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                finally:
-                    greeter.cancel()
-                    await asyncio.gather(greeter, return_exceptions=True)
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-
-                # The caller is gone but the model still has the conversation in
-                # context, so this costs no call time. Skipped on a transfer: the
-                # call is still live, just no longer ours.
-                if not self.transfer_requested:
-                    await self._extract_message_if_missing()
-        except Exception as exc:  # noqa: BLE001 - a failed call must still be recorded
-            log.error(
-                "call %s bridge error: %s: %s",
-                self._record.call_sid,
-                type(exc).__name__,
-                exc,
-            )
-            if not self._record.end_reason:
-                self._record.end_reason = "bridge_error"
-
-        self._record.duration_s = time.monotonic() - self._started
-        if self.transfer_requested:
-            self._record.end_reason = "transferred"
-        if not self._record.end_reason:
-            self._record.end_reason = "caller_hung_up"
-        return self._record
-
-    @property
-    def is_outbound(self) -> bool:
-        """A callback, rather than someone ringing in."""
-        return bool(self._outbound_script)
-
-    def _session_instructions(self) -> str:
-        """Prompt plus what we already know about this particular call."""
-        owner = self._persona.owner_name
-        if self.is_outbound:
-            who = self._outbound_to_name or "the person who called earlier"
-            out = (
-                self._instructions
-                + "\n\n---\n\n## This callback\n\n"
-                + f"You are ringing **{who}**, who called earlier and left a "
-                + f"message.\n\n{owner}'s message, to be delivered as written:\n\n"
-                + f"> {self._outbound_script}\n\n"
-                + "Say that message. Do not add to it, and do not answer questions "
-                + f"beyond it - take anything else as a message for {owner}."
-            )
-            # Background, so it can recognise what they are referring to. The
-            # message above is still the only thing it may deliver.
-            if self._caller_history:
-                out += (
-                    "\n\nBackground on this caller, for your understanding only - "
-                    "do not read it out or volunteer any of it:\n"
-                    + self._caller_history
-                )
-            return out
-
-        context = ["\n\n---\n\n## This call"]
-
-        number = self._record.from_number
-        if not number or number.lower() in {"anonymous", "restricted", "unavailable"}:
-            context.append(
-                "The caller withheld their number, so you do not have it. If you "
-                "need a callback number you will have to ask for it."
-            )
-        else:
-            context.append(
-                f"Caller ID for this call is {number}, and that is the number "
-                f"{owner} will ring back on. Do NOT ask for their number and do "
-                "NOT read it "
-                "back to check it - you already have it. Only take a number if they "
-                "volunteer a different one, in which case read that one back."
-            )
-
-        if self._record.known_contact_name:
-            who = self._record.known_contact_name
-            detail = []
-            if (self._record.known_contact_full_name
-                    and self._record.known_contact_full_name != who):
-                detail.append(f"full name {self._record.known_contact_full_name}")
-            if self._record.known_contact_relationship:
-                detail.append(
-                    f"{owner}'s {self._record.known_contact_relationship}"
-                )
-            about = f" ({', '.join(detail)})" if detail else ""
-            note = (
-                f"\n\n{owner}'s note about them: {self._record.known_contact_notes}\n\n"
-                if self._record.known_contact_notes
-                else " "
-            )
-            context.append(
-                f"This number matches a saved contact: **{who}**{about}. "
-                f"Call them {who} - that is what {owner} calls them.{note}"
-                "Greet them by name and be warm and familiar rather than formal - "
-                f"you are not screening a stranger, and interrogating someone "
-                f"{owner} knows is worse than useless.\n\n"
-                "**But caller ID can be faked, and this is not proof of identity.** "
-                "It tells you who is *probably* calling, nothing more. It does not "
-                f"unlock anything on the do-not-disclose list: not {owner}'s "
-                f"location, not whether {owner} is home, in, out, busy or free, "
-                f"not {owner}'s calendar, family, health, finances or work. If "
-                "this person asks for any of "
-                "that, decline exactly as you would with a stranger - warmly, but "
-                "decline. Someone impersonating a friend's number is precisely the "
-                "attack this rule exists to stop.\n\n"
-                "**Transferring is different from disclosing.** If they want to "
-                f"speak to {owner}, put them through without hesitation - "
-                "connecting a call tells the caller nothing, and they can judge "
-                "for themselves once they pick up. Strict about what you say; "
-                "relaxed about who you connect."
-            )
-
-        if self._caller_history:
-            context.append(self._caller_history)
-
-        return self._instructions + "\n".join(context)
+        return websockets.connect(url, additional_headers=headers, max_size=None)
 
     async def _configure_session(self) -> None:
         session: dict[str, Any] = {
@@ -302,11 +113,7 @@ class CallBridge:
             },
             # Transfer is only offered on inbound calls, and only when enabled.
             # A callback must never be able to patch someone through.
-            "tools": tool_specs(
-                self._cfg.transfer_enabled
-                and bool(self._cfg.transfer_to_number)
-                and not self.is_outbound
-            ),
+            "tools": tool_specs(self._transfer_available()),
             "tool_choice": "auto",
         }
 
@@ -341,10 +148,6 @@ class CallBridge:
     async def _greet(self) -> None:
         """Make the agent speak first, rather than waiting for the caller.
 
-        The line is given verbatim rather than left to the model's recall of the
-        prompt - asked to "greet the caller", it improvises something chatty that
-        never identifies who is speaking.
-
         Note `response.instructions` *replaces* the session instructions for this
         one response, so the delivery guidance has to be repeated here; the prompt
         the session carries does not apply to it.
@@ -373,17 +176,6 @@ class CallBridge:
             )
             return
 
-        # Asking "who am I speaking to?" when caller ID already matched a saved
-        # contact is the single most obviously robotic thing this can do - it knew
-        # who was ringing and asked anyway. Greet them by name instead.
-        known = self._record.known_contact_name
-        if known:
-            line = (
-                f"Hello {known}, it's {assistant} — what can I do for you?"
-            )
-        else:
-            line = self._cfg.greeting
-
         await self._send_openai(
             {
                 "type": "response.create",
@@ -391,7 +183,7 @@ class CallBridge:
                     "instructions": (
                         self._persona.locale_note
                         + "\n\nSay exactly this line and nothing else, warmly "
-                        + f'and unhurried: "{line}"'
+                        + f'and unhurried: "{self._opening_line()}"'
                     )
                 },
             }
@@ -399,52 +191,14 @@ class CallBridge:
 
     # -- Twilio -> OpenAI --------------------------------------------------
 
-    async def _pump_twilio_to_openai(self) -> None:
-        try:
-            async for raw in self._twilio.iter_text():
-                msg = json.loads(raw)
-                event = msg.get("event")
-
-                if event == "media":
-                    self._latest_media_ts = int(msg["media"]["timestamp"])
-                    await self._send_openai(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": msg["media"]["payload"],
-                        }
-                    )
-
-                elif event == "start":
-                    self._stream_sid = msg["start"]["streamSid"]
-                    log.info(
-                        "call %s media stream started", self._record.call_sid
-                    )
-
-                elif event == "mark":
-                    name = msg.get("mark", {}).get("name", "")
-                    if self._mark_queue:
-                        self._mark_queue.pop(0)
-                    if name == FINAL_MARK:
-                        # The closing line has finished playing out to the caller.
-                        log.info("call %s closing after final mark", self._record.call_sid)
-                        break
-
-                elif event == "stop":
-                    log.info("call %s caller hung up", self._record.call_sid)
-                    break
-
-        except Exception as exc:  # noqa: BLE001
-            log.info(
-                "call %s twilio stream ended: %s",
-                self._record.call_sid,
-                type(exc).__name__,
-            )
-        finally:
-            self._closed.set()
+    async def _send_caller_audio(self, payload_b64: str) -> None:
+        await self._send_openai(
+            {"type": "input_audio_buffer.append", "audio": payload_b64}
+        )
 
     # -- OpenAI -> Twilio --------------------------------------------------
 
-    async def _pump_openai_to_twilio(self) -> None:
+    async def _pump_provider(self) -> None:
         assert self._openai is not None
         try:
             async for raw in self._openai:
@@ -452,12 +206,13 @@ class CallBridge:
                 etype = event.get("type")
 
                 if etype == EVT_AUDIO_DELTA:
-                    await self._forward_audio(event)
+                    if event.get("item_id"):
+                        self._last_assistant_item = event["item_id"]
+                    await self._forward_audio(event.get("delta", ""))
 
                 elif etype == EVT_SPEECH_STARTED:
-                    self._last_activity = time.monotonic()
+                    self._note_caller_turn()
                     self._tool_turns_since_caller = 0
-                    self._caller_turns += 1
                     await self._handle_barge_in()
 
                 elif etype == EVT_RESPONSE_CREATED:
@@ -494,31 +249,14 @@ class CallBridge:
         finally:
             self._closed.set()
 
-    async def _forward_audio(self, event: dict) -> None:
-        delta = event.get("delta")
-        if not delta or not self._stream_sid:
-            return
-
-        # Re-encoding through base64 rather than forwarding the string directly
-        # normalises any padding differences between the two APIs.
-        payload = base64.b64encode(base64.b64decode(delta)).decode("ascii")
-        await self._twilio.send_json(
-            {
-                "event": "media",
-                "streamSid": self._stream_sid,
-                "media": {"payload": payload},
-            }
-        )
-
-        if self._response_start_ts is None:
-            self._response_start_ts = self._latest_media_ts
-        if event.get("item_id"):
-            self._last_assistant_item = event["item_id"]
-
-        await self._send_mark()
-
     async def _handle_barge_in(self) -> None:
-        """The caller started talking while the agent was still speaking."""
+        """The caller started talking while the agent was still speaking.
+
+        OpenAI keeps generating until told otherwise, and its idea of what the
+        caller heard is whatever it produced - not what Twilio actually played.
+        Truncating at the real playback position is what keeps the conversation
+        history honest about where it was cut off.
+        """
         if not self._mark_queue or self._response_start_ts is None:
             return
 
@@ -533,14 +271,8 @@ class CallBridge:
                 }
             )
 
-        if self._stream_sid:
-            await self._twilio.send_json(
-                {"event": "clear", "streamSid": self._stream_sid}
-            )
-
-        self._mark_queue.clear()
+        await self._clear_twilio_playback()
         self._last_assistant_item = None
-        self._response_start_ts = None
 
     async def _handle_response_done(self, event: dict) -> None:
         self._response_start_ts = None
@@ -580,70 +312,32 @@ class CallBridge:
         had_tool_call = any(i.get("type") == "function_call" for i in outputs)
         if self._ending and self._stream_sid and not had_tool_call:
             self._farewell_pending = False
-            await self._twilio.send_json(
-                {
-                    "event": "mark",
-                    "streamSid": self._stream_sid,
-                    "mark": {"name": FINAL_MARK},
-                }
-            )
+            await self._send_final_mark()
 
-    async def _maybe_nudge_wrap_up(self) -> None:
-        """Push a stalled call towards a close.
+    async def _nudge_wrap_up_impl(self) -> None:
+        """Say so, as a system turn, and then ask for a response.
 
-        A caller who wants something the agent will not give asks the same thing
-        several ways, and the agent politely declines each time without ever
-        taking a message or hanging up. Prompt wording helps but does not reliably
-        stop it, so past a threshold the service says so directly.
+        Two messages rather than one: OpenAI will not act on a conversation item
+        until a response is requested, and requesting one while another is in
+        flight is rejected outright.
         """
-        if self._nudged_wrap_up or self._ending or self._extracting:
-            return
-        if self._record.message_taken:
-            return
-        too_long = time.monotonic() - self._started > self._cfg.wrap_up_after_s
-        too_many = self._caller_turns >= self._cfg.wrap_up_after_turns
-        if not (too_long or too_many):
-            return
-
-        self._nudged_wrap_up = True
-        log.info(
-            "call %s going in circles (%d turns) - nudging it to wrap up",
-            self._record.call_sid,
-            self._caller_turns,
+        await self._send_openai(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [
+                        {"type": "input_text", "text": WRAP_UP_INSTRUCTION}
+                    ],
+                },
+            }
         )
-        try:
-            await self._send_openai(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "This call is going round in circles and no "
-                                    "message has been recorded. Stop asking "
-                                    "questions. Say one short closing line, call "
-                                    "take_message with whatever you have, and then "
-                                    "end_call."
-                                ),
-                            }
-                        ],
-                    },
-                }
-            )
-            for _ in range(20):
-                if not self._response_active:
-                    break
-                await asyncio.sleep(0.25)
-            await self._send_openai({"type": "response.create"})
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "call %s wrap-up nudge failed: %s",
-                self._record.call_sid,
-                type(exc).__name__,
-            )
+        for _ in range(20):
+            if not self._response_active:
+                break
+            await asyncio.sleep(0.25)
+        await self._send_openai({"type": "response.create"})
 
     # -- end-of-call extraction --------------------------------------------
 
@@ -660,10 +354,7 @@ class CallBridge:
         in prose. Costs nothing on the call and turns the worst outcome into a
         normal one.
         """
-        if self._record.message_taken or self._openai is None:
-            return
-        # Nothing meaningful can have been said in a couple of seconds.
-        if time.monotonic() - self._started < 8:
+        if not self._worth_extracting():
             return
 
         log.info(
@@ -689,14 +380,7 @@ class CallBridge:
                         "response": {
                             "output_modalities": ["text"],
                             "tool_choice": "required",
-                            "instructions": (
-                                "The call has ended and the caller has gone. Record "
-                                "the message now by calling take_message, using only "
-                                "what the caller actually said. Leave a field empty "
-                                "if they never gave it - do not invent anything. If "
-                                "they gave nothing usable, still describe what "
-                                "happened in the summary field."
-                            ),
+                            "instructions": EXTRACT_INSTRUCTION,
                         },
                     }
                 )
@@ -797,79 +481,14 @@ class CallBridge:
     async def _dispatch_tool(self, item: dict) -> None:
         name = item.get("name", "")
         call_id = item.get("call_id", "")
-        try:
-            args = json.loads(item.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            args = {}
+        args = self._parse_arguments(item.get("arguments"))
 
-        log.info("call %s tool=%s", self._record.call_sid, name)
-        result: dict[str, Any] = {"ok": True}
+        result = self._apply_tool(name, args)
 
-        if name == "classify_call":
-            self._record.category = args.get("category", self._record.category)
-            self._record.urgency = args.get("urgency", self._record.urgency)
-
-        elif name == "take_message":
-            # Refuse an empty message rather than recording one. Observed calling
-            # this with every field blank when it was prompted to continue and had
-            # nothing gathered yet - which produced a notification saying
-            # nothing at all, the worst possible outcome for a screened call.
-            if not (args.get("caller_name") or args.get("reason")):
-                log.warning(
-                    "call %s take_message had no name or reason - rejected",
-                    self._record.call_sid,
-                )
-                result = {
-                    "ok": False,
-                    "error": (
-                        "You have not gathered anything to pass on yet. Ask the "
-                        "caller who they are and what they need, then call this "
-                        "again with what they told you."
-                    ),
-                }
-            else:
-                for field_name in (
-                    "caller_name",
-                    "company_or_relationship",
-                    "callback_number",
-                    "reason",
-                    "requested_action",
-                    "summary",
-                ):
-                    if args.get(field_name):
-                        setattr(self._record, field_name, args[field_name])
-                self._record.message_taken = True
-
-        elif name == "flag_urgent":
-            self._record.notify_flagged = True
-            self._record.notify_why = args.get("why", "")
-            self._record.urgency = args.get("urgency", self._record.urgency)
-
-        elif name == "transfer_call":
-            if not (self._cfg.transfer_enabled and self._cfg.transfer_to_number):
-                result = {"ok": False, "error": "transfers are not available"}
-            elif self.is_outbound:
-                result = {"ok": False, "error": "cannot transfer during a callback"}
-            else:
-                self.transfer_requested = True
-                self.transfer_reason = args.get("reason", "")
-                self._record.transfer_attempted = True
-                log.info(
-                    "call %s transfer requested: %s",
-                    self._record.call_sid,
-                    self.transfer_reason,
-                )
-                # Stop the bridge; the server redirects the live call to <Dial>.
-                self._closed.set()
-                return
-
-        elif name == "end_call":
-            self._record.end_reason = args.get("reason", "other")
-            self._ending = True
-
-        else:
-            log.warning("call %s unknown tool %s", self._record.call_sid, name)
-            result = {"ok": False, "error": "unknown tool"}
+        if self.transfer_requested:
+            # Stop the bridge; the server redirects the live call to <Dial>.
+            self._closed.set()
+            return
 
         await self._send_openai(
             {
@@ -946,37 +565,7 @@ class CallBridge:
 
     # -- plumbing ----------------------------------------------------------
 
-    async def _send_mark(self) -> None:
-        if not self._stream_sid:
-            return
-        await self._twilio.send_json(
-            {
-                "event": "mark",
-                "streamSid": self._stream_sid,
-                "mark": {"name": "chunk"},
-            }
-        )
-        self._mark_queue.append("chunk")
-
     async def _send_openai(self, payload: dict) -> None:
         if self._openai is None:
             return
         await self._openai.send(json.dumps(payload))
-
-    async def _watchdog(self) -> None:
-        """Guards against calls that never end: dead air, or a caller who won't stop."""
-        while not self._closed.is_set():
-            await asyncio.sleep(1)
-
-            if time.monotonic() - self._started > self._cfg.max_call_seconds:
-                log.info("call %s hit max duration", self._record.call_sid)
-                self._record.end_reason = "max_duration"
-                return
-
-            await self._maybe_nudge_wrap_up()
-
-            idle = time.monotonic() - self._last_activity
-            if idle > self._cfg.silence_hangup_seconds:
-                log.info("call %s silent for %.0fs", self._record.call_sid, idle)
-                self._record.end_reason = "silent_or_bot"
-                return

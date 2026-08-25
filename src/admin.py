@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .contacts import Contact, normalise
 from .history import CallHistory, _humanise_age
 from .notify import build_bridge
-from .settings import BEHAVIOUR_KEYS, CHANNEL_NAMES, ROUTING_CATEGORIES
+from .settings import BEHAVIOUR_KEYS, CHANNEL_NAMES, CHOICES, ROUTING_CATEGORIES
 from .whatsapp import FLAVOURS
 
 log = logging.getLogger(__name__)
@@ -201,6 +201,21 @@ form.inline { display:inline; }
 .dir.in { background:var(--bg); color:var(--muted); }
 .dir.out { background:color-mix(in srgb, var(--accent) 15%, transparent); color:var(--accent); }
 .note { border-top:1px solid var(--line); padding:11px 16px; }
+
+/* Setup wizard */
+.wizsteps { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+.wizsteps a { display:inline-flex; align-items:center; gap:7px; padding:7px 13px;
+  border-radius:20px; border:1px solid var(--line); background:var(--card);
+  color:var(--muted); text-decoration:none; font-size:13px; }
+.wizsteps a b { display:inline-flex; align-items:center; justify-content:center;
+  width:18px; height:18px; border-radius:50%; background:var(--bg);
+  font-size:11px; font-weight:600; }
+.wizsteps a.on { border-color:var(--accent); color:var(--ink); }
+.wizsteps a.on b { background:var(--accent); color:#fff; }
+.wiznote { border:1px solid var(--line); border-left:3px solid var(--accent);
+  background:var(--card); border-radius:9px; padding:11px 14px; margin-bottom:14px;
+  font-size:13px; color:var(--muted); }
+.field span small { color:var(--faint); font-weight:400; }
 .empty { color:var(--muted); text-align:center; padding:28px 16px; }
 a.num { color:var(--accent); text-decoration:none; font-variant-numeric:tabular-nums; }
 .hint { color:var(--faint); font-size:12.5px; margin:-4px 0 14px; }
@@ -250,6 +265,7 @@ def build_admin_app(
     country_code: str = "44",
     cfg=None,
     notifier=None,
+    secrets=None,
 ) -> FastAPI:
     admin = FastAPI(title="ai-receptionist-admin", docs_url=None, redoc_url=None,
                     openapi_url=None)
@@ -1036,18 +1052,71 @@ def build_admin_app(
             "</div></div></form>"
         )
 
+    def _select(label: str, name: str, value, options, hint: str = "") -> str:
+        """A dropdown, for anything with a knowably finite set of values.
+
+        Preferred over a text box everywhere it is possible: a mistyped voice
+        name or eagerness value does not fail here, it fails on a live call, and
+        by then it is a caller hearing silence rather than a form showing an
+        error. An unrecognised current value is preserved as an extra option so
+        that saving an unrelated field cannot quietly rewrite it.
+        """
+        known = [str(v) for v, _ in options]
+        current = "" if value is None else str(value)
+        extra = (
+            [(current, f"{current} (current, not a known value)")]
+            if current and current not in known
+            else []
+        )
+        rendered = "".join(
+            f'<option value="{_esc(v)}"{" selected" if str(v) == current else ""}>'
+            f"{_esc(text)}</option>"
+            for v, text in list(options) + extra
+        )
+        return (
+            f'<label class="field"><span>{_esc(label)}</span>'
+            f'<select name="{_esc(name)}">{rendered}</select></label>'
+            + (f'<p class="hint">{_esc(hint)}</p>' if hint else "")
+        )
+
+    def _voice_fields() -> str:
+        """The provider-specific knobs, for whichever provider is running.
+
+        Showing both sets at once would be worse than showing the wrong one:
+        every deployment would have boxes that do nothing, and no way to tell
+        which. Choosing the provider, and everything credential-shaped, lives in
+        the setup wizard - this page is for tuning one that already works.
+        """
+        if cfg.voice_provider == "elevenlabs":
+            return (
+                _select("Language", "elevenlabs_language", cfg.elevenlabs_language,
+                        [("", "Use whatever the agent is set to")]
+                        + CHOICES["elevenlabs_language"])
+                + '<p class="hint">Voice, agent and turn-taking belong to '
+                + f"ElevenLabs agent <code>{_esc(cfg.elevenlabs_agent_id or 'unset')}"
+                + '</code>. Pick them in the <a href="/setup/voice">setup wizard</a>, '
+                + "which reads the live list from your account.</p>"
+            )
+        return (
+            '<div class="two">'
+            + _select("Voice", "openai_voice", cfg.openai_voice,
+                      CHOICES["openai_voice"])
+            + _select("Turn-taking", "vad_eagerness", cfg.vad_eagerness,
+                      CHOICES["vad_eagerness"])
+            + "</div>"
+            + _select("Model", "openai_realtime_model", cfg.openai_realtime_model,
+                      CHOICES["openai_realtime_model"])
+        )
+
     def _behaviour_card() -> str:
         return (
             '<form method="post" action="/settings/behaviour"><div class="card">'
-            '<div class="head"><span class="title">How it handles a call</span></div>'
+            '<div class="head"><span class="title">How it handles a call</span>'
+            f'<span class="pill">{_esc(cfg.voice_provider)}</span></div>'
             '<div class="pad">'
             + '<label class="field"><span>Greeting (spoken verbatim to an unknown caller)</span>'
             + f'<textarea name="greeting">{_esc(cfg.greeting)}</textarea></label>'
-            + '<div class="two">'
-            + _field("Voice", "openai_voice", cfg.openai_voice)
-            + _field("Turn-taking eagerness", "vad_eagerness", cfg.vad_eagerness,
-                     "low, auto or high")
-            + "</div>"
+            + _voice_fields()
             + '<div class="two">'
             + _field("Wrap up after (seconds)", "wrap_up_after_s", cfg.wrap_up_after_s)
             + _field("Wrap up after (caller turns)", "wrap_up_after_turns",
@@ -1065,6 +1134,25 @@ def build_admin_app(
                      cfg.history_max_calls)
             + '<div class="actions"><button>Save</button></div>'
             "</div></div></form>"
+        )
+
+    def _wizard_card() -> str:
+        """The way in to first-time setup, from the page people already open."""
+        provider = cfg.voice_provider
+        ready, why = cfg.provider_ready(provider)
+        state = (
+            f'<span class="pill on">{_esc(provider)}</span>'
+            if ready
+            else f'<span class="pill off">{_esc(provider)} — {_esc(why)}</span>'
+        )
+        return (
+            '<div class="card"><div class="head"><span class="title">Setup wizard'
+            f"</span>{state}</div><div class=pad>"
+            '<p class="hint">Voice provider, API keys, and provisioning the '
+            "ElevenLabs agent — with the values that have a knowable set offered "
+            "as dropdowns rather than boxes to mistype.</p>"
+            '<div class="actions"><a class="btn" href="/setup">Open setup wizard'
+            "</a></div></div></div>"
         )
 
     @admin.get("/settings")
@@ -1094,6 +1182,7 @@ def build_admin_app(
         return _page(
             "Settings",
             banner + warn
+            + "<h2>Setup</h2>" + _wizard_card()
             + "<h2>Channels</h2>" + cards
             + "<h2>Routing</h2>" + _routing_card(live)
             + "<h2>Call handling</h2>" + _behaviour_card(),
@@ -1170,9 +1259,20 @@ def build_admin_app(
             return RedirectResponse("/settings", status_code=303)
 
         form = await request.form()
-        values: dict = {}
+        # Seeded from what is already saved rather than started empty, because
+        # this form no longer renders every behaviour key: the voice fields are
+        # whichever pair matches VOICE_PROVIDER. Replacing the block wholesale
+        # would silently wipe the other provider's settings every time this page
+        # was saved, and only show up on the day someone switched provider back.
+        values: dict = dict(
+            (cfg.settings.raw().get("behaviour") or {})
+            if cfg is not None
+            else {}
+        )
         for key, want in BEHAVIOUR_KEYS.items():
             if want is bool:
+                # Every bool is rendered on every variant of this form, so an
+                # absent checkbox really does mean unticked.
                 values[key] = form.get(key) is not None
                 continue
             if key not in form:
@@ -1184,6 +1284,13 @@ def build_admin_app(
                 except ValueError:
                     # Leave the previous value rather than writing a broken one.
                     continue
+            elif key in CHOICES and raw and raw not in dict(CHOICES[key]):
+                # The form renders these as dropdowns, so this only fires on a
+                # hand-crafted POST. Rejected rather than stored: an unknown
+                # voice or eagerness value does not fail here, it fails on a live
+                # call as silence.
+                log.warning("admin sent %s=%r, which is not a known value", key, raw)
+                continue
             else:
                 values[key] = raw
 
@@ -1300,5 +1407,25 @@ def build_admin_app(
     @admin.get("/health")
     async def admin_health() -> dict:
         return {"status": "ok", "surface": "admin"}
+
+    # The setup wizard, in its own module because this one is long enough. It is
+    # handed the helpers rather than importing them, so the auth check, the HTML
+    # escaping and the page shell stay defined exactly once - a second copy of
+    # any of those is how an admin UI grows a hole.
+    if cfg is not None and secrets is not None:
+        from .wizard import register as register_wizard
+
+        register_wizard(
+            admin,
+            {
+                "cfg": cfg,
+                "secrets": secrets,
+                "notifier": notifier,
+                "persist": _persist,
+                "authed": _authed,
+                "page": _page,
+                "esc": _esc,
+            },
+        )
 
     return admin
