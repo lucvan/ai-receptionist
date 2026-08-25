@@ -1,7 +1,7 @@
 services:
   ai-receptionist:
     build: .
-    image: ai-receptionist:1.0.0
+    image: ai-receptionist:0.1.0
     container_name: ai-receptionist
     restart: unless-stopped
     env_file: .env
