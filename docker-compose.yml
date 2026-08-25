@@ -1,0 +1,53 @@
+services:
+  ai-receptionist:
+    build: .
+    image: ai-receptionist:1.0.0
+    container_name: ai-receptionist
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bound to all interfaces because a reverse proxy on another machine has to
+      # reach this host to terminate TLS for your public hostname. If your proxy
+      # or tunnel runs on this same machine, narrow it to "127.0.0.1:5050:5050".
+      # Twilio request signing plus the per-call stream token are what protect
+      # the endpoint either way.
+      - "5050:5050"
+      # Admin UI. Loopback ONLY, and it must stay that way: this port serves the
+      # contact book, the whole call history and the settings page. It must never
+      # be proxied on the public hostname, which has to stay reachable by Twilio.
+      # Reach it remotely over a VPN or Tailscale, not by widening this binding.
+      - "127.0.0.1:5051:5051"
+    volumes:
+      # Prompt is mounted rather than baked in, so wording can be tuned and picked
+      # up on the next call without a rebuild.
+      - ./prompts:/app/prompts:ro
+      # Caller recognition, re-read whenever it changes on disk, so adding a
+      # contact takes effect on the next call with no restart. Writable since the
+      # admin UI edits it; the container's root filesystem stays read-only.
+      - ./config:/app/config:rw
+      - ./logs:/app/logs:rw
+    # Deliberately absent, and must stay absent: the Docker socket, any notes or
+    # document store, any agent's home or credential directory, and any host path
+    # outside this one. See README "Privilege boundary" before adding anything.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - default
+
+# Its own isolated bridge network, joined to no other project. Outbound targets are
+# OpenAI, Twilio, the supervisor if one is configured, and one endpoint per enabled
+# notification channel - nothing else. Keep it that way: the count of things this
+# container can reach IS the privilege boundary.
+networks:
+  default:
+    name: ai-receptionist_default

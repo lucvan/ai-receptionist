@@ -1,0 +1,4 @@
+# Test-only dependencies. Not installed in the runtime image.
+-r requirements.txt
+pytest==8.3.4
+anyio==4.7.0

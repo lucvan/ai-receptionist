@@ -1,0 +1,7 @@
+{
+  "_comment": "Number -> name. Any format works: +447700900123, 07700 900123, 00447700900123. Keys starting with _ are ignored only if you remove them; this file is an example, copy it to contacts.json.",
+
+  "+447700900123": "Dave (plumber)",
+  "07700 900456": "Mum",
+  "+441234567890": "Sarah next door"
+}

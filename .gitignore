@@ -1,0 +1,21 @@
+# Match every .env variant, not just the exact name: a .env.bak or
+# .env.save is just as sensitive and is exactly what gets left behind.
+.env
+.env.*
+!.env.example
+*.secret
+# Call records and state. Kept, but the directory itself must exist in a
+# fresh clone - otherwise Docker creates it root-owned and the non-root user in
+# the container cannot write to it.
+logs/*
+!logs/.gitkeep
+*.log
+__pycache__/
+*.pyc
+.venv/
+
+# Real contacts are personal data - only the example is tracked.
+config/contacts.json
+
+# Written by the admin UI. No secrets, but environment-specific.
+config/settings.json

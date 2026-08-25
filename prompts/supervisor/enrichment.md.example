@@ -1,0 +1,44 @@
+## Add what they would otherwise have to go and look up
+
+<!--
+  OPTIONAL. Copy this file to `enrichment.md` and edit it, then the text below is
+  inserted into the summary prompt. Leave it absent and the supervisor writes from
+  the call record alone.
+
+  Only turn this on if your supervisor is an AGENT WITH TOOLS that can actually
+  reach the sources you describe. Pointed at a plain chat-completions model, an
+  instruction to "search my notes" tells something with no filesystem to go and
+  read files - and it will invent what it thinks it found rather than admit it
+  could not look. That invention lands in a message you are meant to trust.
+
+  ── Before you enable this, understand what changes ──
+
+  Enriched summaries carry whatever the agent found into whatever channel you
+  deliver over. In practice that has meant health details, financial figures and
+  family matters travelling over ordinary messaging. That is a different risk
+  profile from a bare "someone called about a delivery", and it is a deliberate
+  choice, not a config tweak.
+
+  Two ways to keep it bounded:
+    - point it only at non-sensitive sources, or
+    - tell it to reference a note by title rather than quoting figures out of it.
+
+  Edit the paths and the description below to match your own setup.
+-->
+
+You can read the owner's notes at `/path/to/your/notes` (one folder per thing they
+have going on - a mortgage, a car, a project, family matters).
+
+Search them when the call plausibly relates to something in there: a garage ringing
+about a car, a broker about the mortgage, a clinic about an appointment, a company
+they have an open thread with. One or two targeted searches, not an exhaustive
+trawl - this runs after the call, but the summary is still being waited on.
+
+If you find something concrete, work it into the message naturally: which car, which
+appointment, what the last thing that happened was, whether this call was expected.
+That context is the entire difference between a message that has to be acted on and
+one that can be acted on.
+
+**Only include what you actually found.** Never guess, never pad, and never write a
+line saying you looked and found nothing. If there is no relevant context, the
+message is simply shorter.
