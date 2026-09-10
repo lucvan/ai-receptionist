@@ -222,7 +222,9 @@ caller ID is trivially spoofed.
 
 `VOICE_PROVIDER=elevenlabs` swaps the voice, the turn-taking and the billing.
 Nothing else changes — same tools, same summaries, same channels, same callbacks
-and transfers.
+and transfers — with one exception: the switchboard tools a callback uses
+(`press_keys`, `wait_on_hold`, `record_callback_outcome`) are OpenAI-only for now,
+so an ElevenLabs callback that reaches a switchboard stops there.
 
 **The easy way is the setup wizard** at `http://127.0.0.1:5051/setup/voice`:
 paste a key (it is checked for the right scopes before it is stored), pick a

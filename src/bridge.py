@@ -35,9 +35,12 @@ import logging
 import time
 from typing import Any
 
+from . import dtmf
 from .callrecord import CallRecord
 from .config import Config
 from .persona import Persona
+from .tools import CALLBACK_OUTCOMES
+from .ulaw import mean_level
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +65,33 @@ EXTRACT_INSTRUCTION = (
     "field empty if they never gave it - do not invent anything. If they gave "
     "nothing usable, still describe what happened in the summary field."
 )
+
+# The same, for a callback. There the thing most worth recovering is not a
+# message but who actually answered: a summary that assumes the person it rang
+# picked up tells the owner a message was delivered when it was not.
+EXTRACT_CALLBACK_INSTRUCTION = (
+    "The callback has ended and the line is closed. Record how it went now by "
+    "calling record_callback_outcome, using only what actually happened: who "
+    "really answered, and whether the message reached the person it was for. "
+    "If they said anything back for the owner, also call take_message. Do not "
+    "invent anything."
+)
+
+# Far-end audio louder than this counts as activity for the silence guard, on a
+# 16-bit mean-absolute scale (see `ulaw.mean_level`). A quiet line reads in the
+# tens; speech and hold music in the thousands. Without it the guard only saw
+# *finished* turns, and on 2026-09-10 hung up on a caller twelve seconds into a
+# sentence because nothing had finished in the last twenty-five.
+CALLER_AUDIO_ACTIVE_LEVEL = 500.0
+
+# Callback tools that navigate a phone system rather than talk to anyone. After
+# one of these the agent has to listen: prompting a spoken turn would have it
+# talk over the menu, or over the hold music it is waiting through.
+LISTENING_TOOLS = frozenset({"press_keys", "wait_on_hold"})
+
+# Longest key sequence in one press. An extension and a `#` fit; a card number
+# or a dial-out string does not, which is the point.
+MAX_KEYS_PER_PRESS = 12
 
 
 class BaseBridge(abc.ABC):
@@ -88,6 +118,10 @@ class BaseBridge(abc.ABC):
         outbound_script: str = "",
         outbound_to_name: str = "",
         persona: Persona | None = None,
+        outbound_to_company: str = "",
+        outbound_about: str = "",
+        outbound_extension: str = "",
+        outbound_category: str = "",
     ):
         self._twilio = twilio_ws
         self._cfg = cfg
@@ -104,6 +138,11 @@ class BaseBridge(abc.ABC):
         # Empty on an inbound call, which is what distinguishes the two modes.
         self._outbound_script = outbound_script
         self._outbound_to_name = outbound_to_name
+        # What a callback has to get past a switchboard to that person with.
+        self._outbound_to_company = outbound_to_company
+        self._outbound_about = outbound_about
+        self._outbound_extension = outbound_extension
+        self._outbound_category = outbound_category
 
         # The provider socket, once open. Typed loosely because the two providers
         # hand back different connection objects.
@@ -136,6 +175,17 @@ class BaseBridge(abc.ABC):
         # Loop detection: caller turns taken, and whether we have already nudged.
         self._caller_turns = 0
         self._nudged_wrap_up = False
+        # Set the first time the far end takes a turn. A callback waits on it
+        # before speaking: whoever answers a phone speaks first, and a
+        # switchboard's recorded greeting does not stop for anyone.
+        self._remote_spoke = asyncio.Event()
+
+        # Callbacks only: working through a switchboard.
+        self._navigated = False
+        self._keys_pressed: list[str] = []
+        self._pending_keys = ""
+        self._keypad_busy_until = 0.0
+        self._hold_until = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -184,6 +234,11 @@ class BaseBridge(abc.ABC):
                 # call is still live, just no longer ours.
                 if not self.transfer_requested:
                     await self._extract_message_if_missing()
+
+            # The provider socket is closed from here on - which is exactly when
+            # a provider that analyses its own conversations has one to hand back.
+            if not self.transfer_requested and not self._extraction_complete():
+                await self._recover_after_close()
         except Exception as exc:  # noqa: BLE001 - a failed call must still be recorded
             log.error(
                 "call %s bridge error (%s): %s: %s",
@@ -196,6 +251,11 @@ class BaseBridge(abc.ABC):
                 self._record.end_reason = "bridge_error"
 
         self._record.duration_s = time.monotonic() - self._started
+        if (self.is_outbound and not self._record.callback_outcome
+                and not self._caller_turns):
+            # Nothing on the line ever spoke, so nobody can have been given the
+            # message. Say so, rather than leave the summary to guess.
+            self._record.callback_outcome = "no_one_answered"
         if self.transfer_requested:
             self._record.end_reason = "transferred"
         if not self._record.end_reason:
@@ -249,6 +309,29 @@ class BaseBridge(abc.ABC):
         nothing else, which is the worst outcome for a screened call.
         """
 
+    async def _recover_after_close(self) -> None:
+        """A last chance to recover what a call was about, once it has closed.
+
+        Optional. Runs only when extraction left nothing recorded, after the
+        provider socket is shut - which is when a provider that analyses its own
+        conversations has something to hand back.
+        """
+
+    def _extraction_complete(self) -> bool:
+        """Whether what end-of-call extraction exists to recover is recorded.
+
+        A message, on an inbound call. On a callback, how it went: who really
+        answered matters more than anything they said back.
+        """
+        if self.is_outbound:
+            return bool(self._record.callback_outcome)
+        return self._record.message_taken
+
+    def _extract_instruction(self) -> str:
+        if self.is_outbound:
+            return EXTRACT_CALLBACK_INSTRUCTION
+        return EXTRACT_INSTRUCTION
+
     def _worth_extracting(self) -> bool:
         """Whether there is anything to go back and recover.
 
@@ -259,7 +342,7 @@ class BaseBridge(abc.ABC):
         get a lot of silent and automated calls, so this is the common case, not
         an edge one.
         """
-        if self._record.message_taken or self._provider is None:
+        if self._extraction_complete() or self._provider is None:
             return False
         # Nothing meaningful can have been said in a couple of seconds.
         if time.monotonic() - self._started < 8:
@@ -291,6 +374,7 @@ class BaseBridge(abc.ABC):
                 + f"> {self._outbound_script}\n\n"
                 + "Say that message. Do not add to it, and do not answer questions "
                 + f"beyond it - take anything else as a message for {owner}."
+                + self._callback_routing(who)
             )
             # Background, so it can recognise what they are referring to. The
             # message above is still the only thing it may deliver.
@@ -362,6 +446,33 @@ class BaseBridge(abc.ABC):
 
         return self._instructions + "\n".join(context)
 
+    def _callback_routing(self, who: str) -> str:
+        """What a callback has to go on when a switchboard answers, not the person.
+
+        All of it is what the caller told us about themselves - their company,
+        their team, what they rang about - so repeating the routing parts to
+        their own switchboard discloses nothing of the owner's.
+        """
+        facts = [f"- Name: {who}"]
+        if self._outbound_to_company:
+            facts.append(f"- Where they called from: {self._outbound_to_company}")
+        if self._outbound_extension:
+            facts.append(f"- Their extension: {self._outbound_extension}")
+        if self._outbound_category:
+            kind = self._outbound_category.replace("_", " ")
+            facts.append(f"- Kind of call: {kind}")
+        if self._outbound_about:
+            facts.append(
+                f"- What they rang about, in their words: {self._outbound_about}"
+            )
+        return (
+            "\n\n## Who to ask for\n\n"
+            "If a switchboard, a menu or a colleague answers instead of them, this "
+            "is what you have to get through to the right person with. Follow "
+            '"Switchboards, menus and hold" above for how to use it.\n\n'
+            + "\n".join(facts)
+        )
+
     def _opening_line(self) -> str:
         """The exact words the agent opens with.
 
@@ -402,7 +513,14 @@ class BaseBridge(abc.ABC):
 
                 if event == "media":
                     self._latest_media_ts = int(msg["media"]["timestamp"])
-                    await self._send_caller_audio(msg["media"]["payload"])
+                    payload = msg["media"]["payload"]
+                    await self._send_caller_audio(payload)
+                    # Sound from the far end keeps the silence guard off whether
+                    # or not a turn has finished: someone mid-sentence, or a line
+                    # playing hold music, is not dead air.
+                    level = mean_level(base64.b64decode(payload))
+                    if level > CALLER_AUDIO_ACTIVE_LEVEL:
+                        self._last_activity = time.monotonic()
 
                 elif event == "start":
                     self._stream_sid = msg["start"]["streamSid"]
@@ -460,6 +578,11 @@ class BaseBridge(abc.ABC):
         heard yet; without this the agent keeps talking over them long after it
         has stopped generating.
         """
+        if time.monotonic() < self._keypad_busy_until:
+            # Keypad tones are still playing out. A menu starts talking the
+            # moment it hears the first one, and clearing now would wipe the
+            # rest of the sequence out of Twilio's buffer mid-extension.
+            return
         if self._stream_sid:
             await self._twilio.send_json(
                 {"event": "clear", "streamSid": self._stream_sid}
@@ -491,12 +614,53 @@ class BaseBridge(abc.ABC):
             }
         )
 
+    async def _play_pending_keys(self) -> None:
+        """Play the keys `press_keys` accepted into the call, as tones."""
+        keys, self._pending_keys = self._pending_keys, ""
+        if not keys or not self._stream_sid:
+            return
+        # Anything the agent still has queued would play first and push the tones
+        # past the moment the menu is listening for them.
+        await self._clear_twilio_playback()
+        for frame in dtmf.frames(dtmf.tones(keys)):
+            await self._twilio.send_json(
+                {
+                    "event": "media",
+                    "streamSid": self._stream_sid,
+                    "media": {"payload": frame},
+                }
+            )
+        now = time.monotonic()
+        self._keypad_busy_until = now + dtmf.duration_s(keys) + 0.5
+        self._last_activity = now
+
     # -- tools -------------------------------------------------------------
 
     def _note_caller_turn(self) -> None:
         """The caller started speaking: keep the idle and loop guards honest."""
         self._last_activity = time.monotonic()
         self._caller_turns += 1
+        self._remote_spoke.set()
+
+    async def _run_tool(self, name: str, args: dict) -> dict:
+        """Apply a tool call, then do whatever it needs doing on the line.
+
+        `_apply_tool` stays pure bookkeeping. The one tool with an effect on the
+        call itself - pressing keys - is played out here, once the bookkeeping
+        has accepted it.
+        """
+        result = self._apply_tool(name, args)
+        if self._pending_keys:
+            try:
+                await self._play_pending_keys()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "call %s could not play keypad tones: %s",
+                    self._record.call_sid,
+                    type(exc).__name__,
+                )
+                return {"ok": False, "error": "the keys could not be pressed"}
+        return result
 
     def _apply_tool(self, name: str, args: dict) -> dict:
         """Fold one tool call into the call record. Returns the result to send back.
@@ -534,6 +698,7 @@ class BaseBridge(abc.ABC):
                 "caller_name",
                 "company_or_relationship",
                 "callback_number",
+                "extension",
                 "reason",
                 "requested_action",
                 "summary",
@@ -562,12 +727,18 @@ class BaseBridge(abc.ABC):
             self.transfer_requested = True
             self.transfer_reason = args.get("reason", "")
             self._record.transfer_attempted = True
+            self._record.transfer_reason = self.transfer_reason
             log.info(
                 "call %s transfer requested: %s",
                 self._record.call_sid,
                 self.transfer_reason,
             )
             return {"ok": True}
+
+        if name in ("press_keys", "wait_on_hold", "record_callback_outcome"):
+            if not self.is_outbound:
+                return {"ok": False, "error": "only available on a callback"}
+            return self._apply_callback_tool(name, args)
 
         if name == "end_call":
             self._record.end_reason = args.get("reason", "other")
@@ -576,6 +747,67 @@ class BaseBridge(abc.ABC):
 
         log.warning("call %s unknown tool %s", self._record.call_sid, name)
         return {"ok": False, "error": "unknown tool"}
+
+    def _apply_callback_tool(self, name: str, args: dict) -> dict:
+        """The three tools a callback gets for working through a switchboard."""
+        sid = self._record.call_sid
+
+        if name == "record_callback_outcome":
+            outcome = str(args.get("outcome", "") or "")
+            if outcome not in CALLBACK_OUTCOMES:
+                return {
+                    "ok": False,
+                    "error": "outcome must be one of: " + ", ".join(CALLBACK_OUTCOMES),
+                }
+            self._record.callback_outcome = outcome
+            self._record.spoke_to = str(args.get("spoke_to", "") or "")[:120]
+            self._record.callback_notes = str(args.get("notes", "") or "")[:300]
+            log.info("call %s callback outcome=%s", sid, outcome)
+            return {"ok": True}
+
+        # The other two act on a live line, and during extraction there is none.
+        if self._extracting:
+            return {"ok": False, "error": "the call has already ended"}
+
+        if name == "wait_on_hold":
+            self._navigated = True
+            now = time.monotonic()
+            self._hold_until = now + self._cfg.callback_hold_max_s
+            self._last_activity = now
+            log.info("call %s on hold", sid)
+            return {
+                "ok": True,
+                "note": "Waiting. Say nothing until a person speaks to you.",
+            }
+
+        keys = "".join(str(args.get("keys", "") or "").split())
+        if (not keys or len(keys) > MAX_KEYS_PER_PRESS
+                or not dtmf.VALID_KEYS.match(keys)):
+            return {
+                "ok": False,
+                "error": f"keys must be 1-{MAX_KEYS_PER_PRESS} of 0-9, * and #",
+            }
+        if len(self._keys_pressed) >= self._cfg.callback_max_key_presses:
+            # A real menu tree is a handful of presses. Past the ceiling this is
+            # a model going round a menu - or being talked into dialling.
+            log.warning("call %s keypad limit reached", sid)
+            return {
+                "ok": False,
+                "error": (
+                    "You have pressed keys too many times on this call. Stop "
+                    "navigating: record the outcome as automated_dead_end and "
+                    "end the call, unless a person is already speaking to you."
+                ),
+            }
+        self._navigated = True
+        self._keys_pressed.append(keys)
+        self._record.keys_pressed = " ".join(self._keys_pressed)
+        self._pending_keys = keys
+        log.info("call %s pressing %s", sid, keys)
+        return {
+            "ok": True,
+            "note": "Pressed. Stay silent and listen for what comes next.",
+        }
 
     @staticmethod
     def _parse_arguments(raw: Any) -> dict:
@@ -604,6 +836,11 @@ class BaseBridge(abc.ABC):
         """
         if self._nudged_wrap_up or self._ending or self._extracting:
             return
+        if self._navigated:
+            # Getting through a switchboard is slow and records no message on
+            # the way. Told to wrap up, the agent would abandon the menu it is
+            # halfway through; the callback's own time limits bound it instead.
+            return
         if self._record.message_taken:
             return
         too_long = time.monotonic() - self._started > self._cfg.wrap_up_after_s
@@ -626,12 +863,29 @@ class BaseBridge(abc.ABC):
                 type(exc).__name__,
             )
 
+    def _silence_limit(self) -> float:
+        """How long a quiet line is tolerated right now.
+
+        Longer while the agent has said it is on hold: a queue that plays
+        nothing for half a minute is still a queue.
+        """
+        limit = float(self._cfg.silence_hangup_seconds)
+        if time.monotonic() < self._hold_until:
+            limit = max(limit, float(self._cfg.callback_hold_max_s))
+        return limit
+
     async def _watchdog(self) -> None:
         """Guards against calls that never end: dead air, or a caller who won't stop."""
+        # A callback gets longer: a switchboard, a menu and a queue take time.
+        max_seconds = (
+            self._cfg.callback_max_call_seconds
+            if self.is_outbound
+            else self._cfg.max_call_seconds
+        )
         while not self._closed.is_set():
             await asyncio.sleep(1)
 
-            if time.monotonic() - self._started > self._cfg.max_call_seconds:
+            if time.monotonic() - self._started > max_seconds:
                 log.info("call %s hit max duration", self._record.call_sid)
                 self._record.end_reason = "max_duration"
                 return
@@ -639,7 +893,7 @@ class BaseBridge(abc.ABC):
             await self._maybe_nudge_wrap_up()
 
             idle = time.monotonic() - self._last_activity
-            if idle > self._cfg.silence_hangup_seconds:
+            if idle > self._silence_limit():
                 log.info("call %s silent for %.0fs", self._record.call_sid, idle)
                 self._record.end_reason = "silent_or_bot"
                 return

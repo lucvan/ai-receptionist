@@ -52,6 +52,9 @@ class CallRecord:
     caller_name: str = ""
     company_or_relationship: str = ""
     callback_number: str = ""
+    # A direct extension, if they gave one - what a switchboard needs to put a
+    # callback through to them rather than to whoever answers.
+    extension: str = ""
     reason: str = ""
     requested_action: str = ""
     summary: str = ""
@@ -72,6 +75,22 @@ class CallRecord:
     message_taken: bool = False
     transfer_attempted: bool = False
     transfer_connected: bool = False
+    # Why the agent put them through. For a known contact this is the only
+    # record of what they wanted, since they are connected without being asked
+    # for a message first.
+    transfer_reason: str = ""
+
+    # Callbacks only. `callback_for` is who we rang to reach, and is kept apart
+    # from `caller_name` on purpose: a callback can be answered by a switchboard,
+    # a colleague or a machine, and a summary that reads the intended name as
+    # the person reached tells the owner a message was delivered when it was not.
+    callback_for: str = ""
+    callback_outcome: str = ""
+    spoke_to: str = ""
+    callback_notes: str = ""
+    # Menu keys played into the call, in order. Menu choices, not secrets - kept
+    # so a callback that got lost in a phone tree can be diagnosed.
+    keys_pressed: str = ""
     # The summary the supervisor composed. Kept here so the call is still legible
     # even when the supervisor has no messaging tool wired up to deliver it.
     supervisor_summary: str = ""
@@ -117,12 +136,18 @@ class CallRecord:
 
         return self.callback_number
 
-    def to_supervisor_payload(self) -> dict:
+    def to_supervisor_payload(self, transfer_state: str = "") -> dict:
         """The sanitized structure handed to the supervisor.
 
         Note what is absent: no audio, no raw caller utterances, no stream ids, no
         credentials. The supervisor sees a summary written by the receptionist, not
         anything the caller authored directly.
+
+        `transfer_state` is "ringing" when the summary is written while the
+        owner's phone rings, or "failed" when the call could not be put through
+        at all. The record cannot say which by itself - it is written before the
+        outcome exists - and a summary reading `end_reason: transferred` as
+        "they were put through" is exactly the mistake this is here to stop.
         """
         payload = {
             "call_sid": self.call_sid,
@@ -134,6 +159,7 @@ class CallRecord:
             "caller_name": self.caller_name,
             "company_or_relationship": self.company_or_relationship,
             "callback_number": self.resolved_callback(),
+            "extension": self.extension,
             "category": self.category,
             "reason": self.reason,
             "requested_action": self.requested_action,
@@ -143,7 +169,34 @@ class CallRecord:
             "flagged_urgent": self.notify_flagged,
             "flagged_why": self.notify_why,
             "message_taken": self.message_taken,
+            "transfer_reason": self.transfer_reason,
         }
+
+        if transfer_state == "ringing":
+            payload["end_reason"] = "being_put_through"
+            payload["transfer_status"] = (
+                "the owner's phone is ringing now - whether they answer is not "
+                "known yet"
+            )
+        elif transfer_state == "failed":
+            payload["end_reason"] = "transfer_failed"
+            payload["transfer_status"] = (
+                "could not be put through - the caller had already hung up or "
+                "the line dropped"
+            )
+
+        if self.direction == "outbound":
+            payload["callback_for"] = self.callback_for
+            payload["callback_outcome"] = self.callback_outcome or "not_recorded"
+            payload["spoke_to"] = self.spoke_to
+            payload["callback_notes"] = self.callback_notes
+            payload["keys_pressed"] = self.keys_pressed
+            if (self.callback_outcome != "delivered_to_person"
+                    and self.caller_name == self.callback_for):
+                # Filled in from the callback, not heard on the call. Handing it
+                # over as `caller_name` is how a callback that a switchboard
+                # recording answered got reported as the caller picking up.
+                payload.pop("caller_name", None)
         # Drop empty values rather than sending a skeleton of blanks. The
         # supervisor is asked to write prose and mention only what is known;
         # handing it a form full of "" invites it to echo the form back.

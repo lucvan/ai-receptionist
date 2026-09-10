@@ -37,6 +37,12 @@ class PendingCall:
     category: str
     summary: str
     created_at: float
+    # What a callback needs to get past a switchboard: where they called from,
+    # what the call was about, and an extension. Defaulted so entries written
+    # before these existed still load.
+    company: str = ""
+    reason: str = ""
+    extension: str = ""
 
     @property
     def display_name(self) -> str:

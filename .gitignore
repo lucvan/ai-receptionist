@@ -23,3 +23,7 @@ config/settings.json
 # Written by the setup wizard, and this one DOES hold credentials: the voice
 # provider key, Twilio, and one per notification channel. Never commit it.
 config/secrets.json
+
+# Points the supervisor at your own notes - where they live and what is in
+# them. Only the example is tracked.
+prompts/supervisor/enrichment.md

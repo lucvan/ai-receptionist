@@ -148,13 +148,15 @@ class CallHistory:
 
     # -- deleting ----------------------------------------------------------
 
-    def _rewrite_calls(self, keep) -> int:
+    def _rewrite_calls(self, keep, amend=None) -> int:
         """Rewrite every call log, keeping only records `keep(rec)` accepts.
 
-        Returns how many were removed. Written to a temp file and moved into
-        place, so an interrupted delete cannot truncate the log.
+        `amend(rec)`, when given, may return a changed copy of a kept record to
+        write in its place, or None to leave it untouched. Returns how many
+        records were removed or amended. Written to a temp file and moved into
+        place, so an interrupted rewrite cannot truncate the log.
         """
-        removed = 0
+        touched = 0
         for name in sorted(self._stamps) or [p.name for p in
                                              self._log_dir.glob("calls-*.jsonl")]:
             path = self._log_dir / name
@@ -163,7 +165,7 @@ class CallHistory:
             except OSError:
                 continue
             kept = []
-            dropped = 0
+            changed = 0
             for line in lines:
                 if not line.strip():
                     continue
@@ -174,13 +176,18 @@ class CallHistory:
                     # discarded by an unrelated delete.
                     kept.append(line)
                     continue
-                if keep(rec):
+                if not keep(rec):
+                    changed += 1
+                    continue
+                amended = amend(rec) if amend else None
+                if amended is None:
                     kept.append(line)
                 else:
-                    dropped += 1
-            if not dropped:
+                    kept.append(json.dumps(amended, ensure_ascii=False))
+                    changed += 1
+            if not changed:
                 continue
-            removed += dropped
+            touched += changed
             tmp = path.with_suffix(".jsonl.tmp")
             try:
                 tmp.write_text(
@@ -189,9 +196,24 @@ class CallHistory:
                 tmp.replace(path)
             except OSError as exc:
                 log.error("could not rewrite %s: %s", name, exc)
-        if removed:
+        if touched:
             self.reload(force=True)
-        return removed
+        return touched
+
+    def update_call(self, call_sid: str, **fields) -> bool:
+        """Amend one call record in place.
+
+        For facts that arrive after the record was written: whether a transfer
+        was answered is only known once the owner's phone stops ringing, by
+        which time the call has already been logged.
+        """
+        if not call_sid or not fields:
+            return False
+
+        def amend(rec: dict) -> dict | None:
+            return {**rec, **fields} if rec.get("call_sid") == call_sid else None
+
+        return self._rewrite_calls(lambda _rec: True, amend) > 0
 
     def delete_call(self, call_sid: str) -> int:
         if not call_sid:

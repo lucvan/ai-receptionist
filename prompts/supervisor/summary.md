@@ -54,6 +54,30 @@ Scale the length to what happened. A solar-panel pitch deserves one line and no
 detail. A tradesperson rescheduling something deserves two sentences and the number.
 Nobody needs a paragraph about a call that was hung up after four seconds.
 
+## When the call was a callback
+
+`direction: outbound` means nobody rang in: this was a callback placed on
+{{owner_name}}'s behalf to deliver their reply. Write it as what happened to that
+callback.
+
+- `callback_for` is who the callback was **trying** to reach. It is not evidence
+  that they answered.
+- `callback_outcome` and `spoke_to` say what actually happened. Report it plainly:
+  delivered to them, left with a named colleague, stuck at a switchboard or a
+  menu, voicemail, nobody there. If it is `not_recorded`, say it is unclear who
+  answered and whether the message got through. Never assume it was delivered.
+- On a callback, `reason`, `summary` and `requested_action` are what was said
+  back, by whoever `spoke_to` is.
+
+## When a caller was being put through
+
+`end_reason: being_put_through` means {{owner_name}}'s phone is ringing as they
+read this, and nobody knows yet whether they will answer. Say the caller is being
+put through - never that they were put through, connected or transferred.
+`transfer_failed` means they could not be put through at all; say so. Either way,
+`transfer_reason` is why they wanted to speak to {{owner_name}}: use it when the
+record has no other reason.
+
 {{enrichment}}
 
 ## Boundaries

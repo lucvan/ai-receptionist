@@ -69,6 +69,30 @@ The agent has exactly four tools, none of which read anything:
 `transfer_call` is added only when `TRANSFER_ENABLED=1`, so an agent that must not
 transfer cannot be talked into it — it never sees the tool.
 
+A **callback** gets three more, and never `transfer_call`. A number that rang you is
+often a company's main line, so ringing it back can land on a switchboard rather
+than the person:
+
+| tool | what it does |
+|---|---|
+| `press_keys` | plays keypad tones into the call, to answer a menu or enter an extension |
+| `wait_on_hold` | stays silent through hold music or a queue, and stretches the silence guard meanwhile |
+| `record_callback_outcome` | records who actually answered, and whether the message reached the person it was for |
+
+`press_keys` is the only tool that acts on anything, and it is bounded on purpose:
+keypad characters only, at most 12 per press and `CALLBACK_MAX_KEY_PRESSES` per
+call, never offered on an inbound call, and never used because whoever answers asks
+for it — a PBX will take a key sequence as an instruction to dial out. Twilio Media
+Streams cannot send DTMF as signalling, so the tones are played as in-band audio,
+which G.711 carries untouched.
+
+The callback agent is told who to ask for: the caller's name, the company and team
+they gave, an extension if they left one, and what they rang about in their own
+words. Never the owner's reply, and never the summary, which may carry context from
+your notes. It may leave the message with a colleague on the caller's team for a
+practical business matter (a delivery, a booking), never for a personal one, and
+never on a voicemail.
+
 The live call makes **no outbound calls of any kind**. The supervisor is reached
 only after the caller has hung up, to compose the notification. A fifth tool,
 `ask_supervisor`, was removed: see `src/tools.py` for the measurements that
@@ -378,7 +402,11 @@ externally instead.
 ## Call guards
 
 A call ends automatically after `MAX_CALL_SECONDS` (default 300) or after
-`SILENCE_HANGUP_SECONDS` of no activity (default 25). The agent can also hang up
+`SILENCE_HANGUP_SECONDS` of no activity (default 25). Activity includes any sound
+from the far end, not just finished turns, so a caller who is mid-sentence is not
+taken for dead air. A callback gets `CALLBACK_MAX_CALL_SECONDS` (default 480) to
+get through a switchboard, and while the agent waits on hold the silence guard
+stretches to `CALLBACK_HOLD_MAX_S` (default 180). The agent can also hang up
 itself via `end_call` — it says its closing line first, then the service sends a
 Twilio `mark` and closes only once Twilio echoes it back, so the goodbye is never
 cut off mid-word.
@@ -556,6 +584,15 @@ ever needs to message one person.
   surface. Set `HISTORY_ENABLED=false` if that trade is wrong for you.
 - **Barge-in relies on Twilio's media timestamps.** If the agent ever talks over an
   interrupting caller, that truncation arithmetic is the place to look.
+- **Keypad tones are in-band.** Switchboards on landlines and most VoIP systems hear
+  them. A menu behind a heavily compressed mobile voice path may not, in which case
+  a callback records `automated_dead_end` rather than getting through.
+- **Switchboard navigation is OpenAI-only.** The ElevenLabs agent is provisioned
+  with the inbound tools, so a callback on ElevenLabs stops at a switchboard and its
+  outcome is reported as unclear rather than guessed.
+- **A transfer is announced before it is answered.** The summary is written while
+  your phone rings, so it says the caller is *being* put through; a second message
+  follows if you miss it.
 
 ## Licence
 

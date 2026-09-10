@@ -28,7 +28,7 @@ from typing import Any
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from .bridge import EXTRACT_INSTRUCTION, WRAP_UP_INSTRUCTION, BaseBridge
+from .bridge import LISTENING_TOOLS, WRAP_UP_INSTRUCTION, BaseBridge
 from .tools import tool_specs
 
 log = logging.getLogger(__name__)
@@ -51,6 +51,11 @@ EVT_INPUT_TRANSCRIPT = "conversation.item.input_audio_transcription.completed"
 # end_call, so this has to sit comfortably above four: cutting a real chain short
 # would strand the caller in the silence this guard exists to prevent.
 MAX_TOOL_TURNS_PER_CALLER_TURN = 8
+
+# How long a callback waits for whoever answers to speak before opening itself.
+# People pick up with "Hello?" or a company name inside a second or two, and a
+# switchboard recording starts at once; only a silent line gets a greeting.
+OUTBOUND_OPENING_WAIT_S = 3.0
 
 
 class CallBridge(BaseBridge):
@@ -113,7 +118,7 @@ class CallBridge(BaseBridge):
             },
             # Transfer is only offered on inbound calls, and only when enabled.
             # A callback must never be able to patch someone through.
-            "tools": tool_specs(self._transfer_available()),
+            "tools": tool_specs(self._transfer_available(), outbound=self.is_outbound),
             "tool_choice": "auto",
         }
 
@@ -143,6 +148,18 @@ class CallBridge(BaseBridge):
                 "call %s: session.updated did not arrive, greeting anyway",
                 self._record.call_sid,
             )
+        if self.is_outbound:
+            # Whoever picks up speaks first - "Hello?", a company name, or a
+            # switchboard recording that talks over anything said to it. When
+            # they do, semantic VAD creates the reply to what they said; only a
+            # line that stays quiet gets an opening line from us.
+            try:
+                await asyncio.wait_for(
+                    self._remote_spoke.wait(), timeout=OUTBOUND_OPENING_WAIT_S
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
         await self._greet()
 
     async def _greet(self) -> None:
@@ -380,7 +397,7 @@ class CallBridge(BaseBridge):
                         "response": {
                             "output_modalities": ["text"],
                             "tool_choice": "required",
-                            "instructions": EXTRACT_INSTRUCTION,
+                            "instructions": self._extract_instruction(),
                         },
                     }
                 )
@@ -392,7 +409,7 @@ class CallBridge(BaseBridge):
                     continue
                 if outcome != "tools":
                     break
-                if self._record.message_taken:
+                if self._extraction_complete():
                     break
         except (TimeoutError, asyncio.TimeoutError):
             log.warning(
@@ -483,7 +500,7 @@ class CallBridge(BaseBridge):
         call_id = item.get("call_id", "")
         args = self._parse_arguments(item.get("arguments"))
 
-        result = self._apply_tool(name, args)
+        result = await self._run_tool(name, args)
 
         if self.transfer_requested:
             # Stop the bridge; the server redirects the live call to <Dial>.
@@ -513,6 +530,12 @@ class CallBridge(BaseBridge):
         #
         # Nobody is on the line during extraction, so no follow-up turn.
         if self._extracting:
+            return
+
+        if name in LISTENING_TOOLS and result.get("ok"):
+            # Navigating, not talking. The next thing to answer is whatever the
+            # menu or the person on the line says - semantic VAD creates that
+            # turn - so asking for one now would have the agent talk over it.
             return
 
         if self._ending:

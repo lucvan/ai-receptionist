@@ -309,6 +309,22 @@ async def incoming_call(request: Request) -> PlainTextResponse:
     if not call_sid:
         return PlainTextResponse("missing CallSid", status_code=400)
 
+    own = "".join(c for c in config.twilio_phone_number if c.isdigit())
+    caller = "".join(c for c in params.get("From", "") if c.isdigit())
+    if own and caller == own:
+        # Our own number ringing us. In practice that is a transfer: <Dial> rang
+        # the owner's mobile, nobody answered, and the carrier diverted it
+        # straight back here - so the receptionist answered itself, and the
+        # owner got a "silent caller" summary about nobody. Rejecting it hands
+        # <Dial> a busy result, and the real caller hears the apology instead.
+        log.info("call %s is from our own number (a diverted transfer) - rejected",
+                 call_sid)
+        return PlainTextResponse(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Reject reason="busy"/></Response>',
+            media_type="application/xml",
+        )
+
     missing = config.missing_required()
     if missing:
         log.error("call %s arrived but service is unconfigured: %s", call_sid, missing)
@@ -407,6 +423,13 @@ async def _handle_owner_reply(reply_to: int | None, text: str) -> None:
             "number": call.number,
             "name": call.caller_name,
             "script": script,
+            # For getting past a switchboard to them. `reason` is the caller's
+            # own account of their call. The summary is deliberately not
+            # passed: the supervisor may have enriched it from the owner's notes.
+            "company": call.company,
+            "about": call.reason,
+            "extension": call.extension,
+            "category": call.category,
         },
     )
 
@@ -534,8 +557,14 @@ async def transfer_result(request: Request) -> PlainTextResponse:
     status = str(form.get("DialCallStatus", ""))
     entry = transfers.take(token) or {}
     who = entry.get("caller_name") or "A caller"
+    connected = status == "completed"
 
-    if status == "completed":
+    # The call was logged while the phone was still ringing, so the outcome is
+    # written back onto that record now that it exists.
+    if entry.get("call_sid"):
+        history.update_call(entry["call_sid"], transfer_connected=connected)
+
+    if connected:
         log.info("transfer connected for %s", who)
         await notifier.send(f"✅ Put {who} through to you.")
         return PlainTextResponse(
@@ -544,9 +573,16 @@ async def transfer_result(request: Request) -> PlainTextResponse:
         )
 
     log.info("transfer not answered (%s) for %s", status, who)
+    why = (entry.get("reason") or "").rstrip(".")
+    left = (
+        "Their message is in the summary above."
+        if entry.get("has_message")
+        else "They didn't leave a message."
+    )
     await notifier.send(
-        f"📞 {who} asked to be put through and you didn't pick up "
-        f"({status or 'no answer'}). Their message is in the summary above."
+        f"📞 Missed: {who} wanted to speak to you"
+        + (f" — {why}" if why else "")
+        + f". You didn't pick up ({status or 'no answer'}). {left}"
     )
     return PlainTextResponse(
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -625,6 +661,7 @@ async def media_stream(websocket: WebSocket) -> None:
         # "whoever is on the other end", so keep that meaning consistent.
         record.from_number = callback["number"]
         record.caller_name = callback.get("name", "")
+        record.callback_for = callback.get("name", "")
         record.known_contact_name = contacts.lookup(callback["number"])
         log.info(
             "callback %s ringing %s", call_sid, callback.get("name") or "caller"
@@ -679,6 +716,10 @@ async def media_stream(websocket: WebSocket) -> None:
         outbound_script=(callback or {}).get("script", ""),
         outbound_to_name=(callback or {}).get("name", ""),
         persona=persona,
+        outbound_to_company=(callback or {}).get("company", ""),
+        outbound_about=(callback or {}).get("about", ""),
+        outbound_extension=(callback or {}).get("extension", ""),
+        outbound_category=(callback or {}).get("category", ""),
     )
 
     try:
@@ -697,7 +738,15 @@ async def media_stream(websocket: WebSocket) -> None:
 
 
 async def _start_transfer(record: CallRecord, reason: str) -> None:
-    """Redirect the live call to <Dial>, so the owner's phone rings."""
+    """Redirect the live call to <Dial>, so the owner's phone rings.
+
+    The redirect goes first. From the moment the agent says "putting you
+    through", the caller is on a silent line, and composing the summary can take
+    twenty seconds: on 2026-09-03 a caller hung up waiting, and the redirect then
+    failed because there was no call left to redirect. So the summary is written
+    while the phone rings instead - still in time to leave the details if the
+    owner misses it.
+    """
     token = mint_stream_token(config.stream_secret, f"transfer:{record.call_sid}")
     transfers.put(
         token,
@@ -705,12 +754,9 @@ async def _start_transfer(record: CallRecord, reason: str) -> None:
             "call_sid": record.call_sid,
             "caller_name": record.caller_name or record.known_contact_name or "",
             "reason": reason,
+            "has_message": record.message_taken,
         },
     )
-
-    # The message is written and notified *before* the transfer is attempted, so a
-    # missed call still leaves something to act on.
-    await _finish_call(record, transferring=True)
 
     ok, detail = await outbound.redirect_call(
         record.call_sid, f"{config.public_base_url}/transfer?token={token}"
@@ -718,13 +764,10 @@ async def _start_transfer(record: CallRecord, reason: str) -> None:
     if not ok:
         transfers.take(token)
         log.error("could not transfer call %s: %s", record.call_sid, detail)
-        await notifier.send(
-            f"Tried to put {record.caller_name or 'a caller'} through but the "
-            f"transfer failed — {detail}"
-        )
+    await _finish_call(record, transfer_state="ringing" if ok else "failed")
 
 
-async def _finish_call(record: CallRecord, transferring: bool = False) -> None:
+async def _finish_call(record: CallRecord, transfer_state: str = "") -> None:
     """Persist the minimised record and hand it to the supervisor."""
     log.info("call ended %s", record.log_line())
 
@@ -740,7 +783,9 @@ async def _finish_call(record: CallRecord, transferring: bool = False) -> None:
                      record.call_sid)
             record.callback_number = corrected
 
-    payload = record.to_supervisor_payload()
+    if transfer_state == "failed":
+        record.end_reason = "transfer_failed"
+    payload = record.to_supervisor_payload(transfer_state)
 
     # The supervisor writes the summary, because it is the side with the context to
     # spot a useful follow-up. If it cannot, we compose one locally rather than let
@@ -768,12 +813,12 @@ async def _finish_call(record: CallRecord, transferring: bool = False) -> None:
     except OSError as exc:
         log.error("could not write call record: %s", exc)
 
-    if transferring:
-        # Sent before the transfer is attempted, so a missed call still leaves
-        # the message rather than just a missed-call notification.
+    if transfer_state == "ringing":
+        # Written while the owner's phone rings, so a missed transfer still
+        # leaves the details rather than only a missed-call line.
         summary_text = (
-            "📞 Putting a caller through — details below in case you miss them.\n\n"
-            + summary_text
+            "📞 Putting a caller through now — details below in case you miss "
+            "them.\n\n" + summary_text
         )
 
     refs = await notifier.send(summary_text, category=record.category, payload=payload)
@@ -801,6 +846,9 @@ async def _finish_call(record: CallRecord, transferring: bool = False) -> None:
                     category=record.category,
                     summary=record.summary or summary_text[:400],
                     created_at=time.time(),
+                    company=record.company_or_relationship,
+                    reason=record.reason,
+                    extension=record.extension,
                 ),
             )
     elif notifier.suppressed(record.category):

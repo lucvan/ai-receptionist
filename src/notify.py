@@ -68,6 +68,9 @@ def format_fallback(payload: dict) -> str:
     unless it is actually known. A line reading "Company: not given" is worse than
     no line at all - it costs a glance and carries no information.
     """
+    if payload.get("direction") == "outbound":
+        return _format_callback_fallback(payload)
+
     category = payload.get("category", "unknown")
     urgent = payload.get("flagged_urgent") or payload.get("claimed_urgency") == "high"
 
@@ -98,7 +101,12 @@ def format_fallback(payload: dict) -> str:
     label = CATEGORY_LABELS.get(category, category)
     parts = [f"{marker} {subject} called — {label}."]
 
-    reason = payload.get("reason") or payload.get("summary") or ""
+    reason = (
+        payload.get("reason")
+        or payload.get("summary")
+        or payload.get("transfer_reason")
+        or ""
+    )
     if reason:
         parts.append(reason if reason.endswith((".", "!", "?")) else reason + ".")
 
@@ -109,7 +117,14 @@ def format_fallback(payload: dict) -> str:
     if payload.get("flagged_urgent") and payload.get("flagged_why"):
         parts.append(f"Flagged urgent: {payload['flagged_why']}")
 
-    if not payload.get("message_taken") and not reason:
+    end_reason = payload.get("end_reason")
+    if end_reason == "being_put_through":
+        parts.append("Putting them through to you now.")
+    elif end_reason == "transfer_failed":
+        parts.append(
+            "I couldn't put them through — they'd gone before the transfer started."
+        )
+    elif not payload.get("message_taken") and not reason:
         parts.append("They rang off before leaving anything useful.")
 
     suggestion = SUGGESTED_ACTION.get(category)
@@ -122,6 +137,59 @@ def format_fallback(payload: dict) -> str:
     if callback and category != "spam_telesales":
         text += f"\n\n{callback}"
 
+    return text
+
+
+def _format_callback_fallback(payload: dict) -> str:
+    """The local message for a callback: what happened to it, not who "called".
+
+    Built from `callback_outcome`, never from the name the callback was for -
+    that says who was meant to answer, not who did.
+    """
+    who = payload.get("callback_for") or "them"
+    spoke_to = payload.get("spoke_to") or ""
+    outcome = payload.get("callback_outcome") or "not_recorded"
+    lines = {
+        "delivered_to_person": f"Rang {who} back and gave them your message.",
+        "delivered_to_colleague": (
+            f"Rang {who} back. They weren't available, so your message went to "
+            f"{spoke_to or 'a colleague'}."
+        ),
+        "callback_requested": (
+            f"Rang {who} back but couldn't reach them; asked "
+            f"{spoke_to or 'whoever answered'} to have them ring you."
+        ),
+        "person_unavailable": (
+            f"Rang {who} back but they weren't available, and nothing was left."
+        ),
+        "voicemail": f"Rang {who} back and got voicemail, so nothing was left.",
+        "automated_dead_end": (
+            f"Rang {who} back but couldn't get past the automated system."
+        ),
+        "wrong_number": f"Rang {who} back, but whoever answered didn't know them.",
+        "declined": (
+            f"Rang {who} back, but {spoke_to or 'whoever answered'} wouldn't put "
+            "me through."
+        ),
+        "no_one_answered": f"Rang {who} back but nobody spoke.",
+    }
+    text = "📞 " + lines.get(
+        outcome,
+        f"Rang {who} back, but it isn't clear who answered or whether your "
+        "message got through.",
+    )
+
+    notes = payload.get("callback_notes") or ""
+    if notes:
+        text += " " + (notes if notes.endswith((".", "!", "?")) else notes + ".")
+
+    said = payload.get("reason") or payload.get("summary") or ""
+    if payload.get("message_taken") and said:
+        text += f" They said: {said}"
+
+    callback = payload.get("callback_number")
+    if callback:
+        text += f"\n\n{callback}"
     return text
 
 

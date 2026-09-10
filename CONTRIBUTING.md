@@ -35,6 +35,13 @@ a security decision rather than a feature decision.
 agent that cannot see a tool cannot be argued into using it — prefer that pattern
 over prompt instructions when the stakes are real.
 
+A callback gets three more (`press_keys`, `wait_on_hold`, `record_callback_outcome`)
+and never `transfer_call`, the same pattern in the other direction: an inbound caller
+never sees the keypad. `press_keys` is the one tool that acts on anything, so its
+limits live in code, not only in its description — keypad characters, sequence
+length, presses per call. Whoever answers a callback is as untrusted as any caller,
+and a PBX will take a key sequence as an instruction to dial out.
+
 ---
 
 ## Code map
@@ -47,6 +54,8 @@ src/
   realtime.py       the OpenAI Realtime half of a bridge
   elevenlabs.py     the ElevenLabs Agents half of a bridge
   tools.py          the complete tool surface — this file IS the privilege boundary
+  dtmf.py           keypad tones as audio; Media Streams cannot send DTMF signalling
+  ulaw.py           G.711 u-law both ways, and a far-end level for the silence guard
   callrecord.py     the only thing kept about a call
   persona.py        whose calls this answers; prompt placeholder rendering
   config.py         env baseline

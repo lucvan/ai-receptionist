@@ -55,7 +55,7 @@ import httpx
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from .bridge import EXTRACT_INSTRUCTION, WRAP_UP_INSTRUCTION, BaseBridge
+from .bridge import WRAP_UP_INSTRUCTION, BaseBridge
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +91,11 @@ END_OF_SPEECH_GRACE_S = 1.0
 # has to be short enough not to delay the notification noticeably.
 EXTRACTION_TIMEOUT_S = 20.0
 
+# ElevenLabs analyses a conversation a few seconds after it closes. Polled for at
+# most this long, because the owner's notification is waiting on it.
+ANALYSIS_WAIT_S = 45.0
+ANALYSIS_POLL_S = 3.0
+
 PLACEHOLDER = re.compile(r"\{\{\s*([^}]*?)\s*\}\}")
 
 
@@ -120,6 +125,51 @@ def _neutralise_placeholders(text: str, call_sid: str) -> str:
         ", ".join(sorted(set(left))),
     )
     return out
+
+
+async def fetch_transcript_summary(
+    conversation_id: str,
+    api_key: str,
+    wait_s: float = ANALYSIS_WAIT_S,
+    poll_s: float = ANALYSIS_POLL_S,
+) -> str:
+    """ElevenLabs' own summary of a finished conversation, or "" if none comes.
+
+    The analysis only exists once the conversation has closed and takes a few
+    seconds after that, so this polls, within a bound.
+    """
+    url = f"{ELEVENLABS_API}/v1/convai/conversations/{conversation_id}"
+    deadline = time.monotonic() + wait_s
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                resp = await client.get(url, headers={"xi-api-key": api_key})
+            except httpx.HTTPError as exc:
+                log.warning("elevenlabs analysis fetch failed: %s", type(exc).__name__)
+                resp = None
+
+            if resp is not None and resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                analysis = data.get("analysis") or {}
+                summary = str(analysis.get("transcript_summary") or "").strip()
+                if summary:
+                    return summary
+                if data.get("status") == "failed":
+                    return ""
+            elif resp is not None and resp.status_code != 404:
+                # A 404 is a conversation not visible yet. Anything else will
+                # not get better for waiting.
+                log.warning(
+                    "elevenlabs analysis fetch returned HTTP %s", resp.status_code
+                )
+                return ""
+
+            if time.monotonic() >= deadline:
+                return ""
+            await asyncio.sleep(poll_s)
 
 
 class ElevenLabsBridge(BaseBridge):
@@ -401,7 +451,7 @@ class ElevenLabsBridge(BaseBridge):
         tool_call_id = call.get("tool_call_id", "")
         args = self._parse_arguments(call.get("parameters"))
 
-        result = self._apply_tool(name, args)
+        result = await self._run_tool(name, args)
 
         if self.transfer_requested:
             # No result sent, deliberately. Acknowledging it would start the agent
@@ -484,7 +534,10 @@ class ElevenLabsBridge(BaseBridge):
             await self._send_agent(
                 {
                     "type": "user_message",
-                    "text": f"[system, not spoken by the caller] {EXTRACT_INSTRUCTION}",
+                    "text": (
+                        "[system, not spoken by the caller] "
+                        + self._extract_instruction()
+                    ),
                 }
             )
             async with asyncio.timeout(EXTRACTION_TIMEOUT_S):
@@ -497,7 +550,7 @@ class ElevenLabsBridge(BaseBridge):
                         # It often does its bookkeeping first - classify_call, or
                         # a second end_call - so keep reading until the one that
                         # matters lands or the timeout runs out.
-                        if self._record.message_taken:
+                        if self._extraction_complete():
                             break
 
                     elif etype == EVT_PING:
@@ -517,16 +570,51 @@ class ElevenLabsBridge(BaseBridge):
             # The record is updated before the acknowledgement goes out, so a
             # socket that closes on that last write has not actually lost
             # anything. Only say it failed if it did.
-            if not self._record.message_taken:
+            if not self._extraction_complete():
                 log.warning(
                     "call %s message extraction failed: %s",
                     self._record.call_sid,
                     type(exc).__name__,
                 )
 
-        if not self._record.message_taken:
+        if not self._extraction_complete():
             log.warning(
                 "call %s: extraction produced no message", self._record.call_sid
+            )
+
+    async def _recover_after_close(self) -> None:
+        """Fall back to ElevenLabs' own summary of the conversation.
+
+        In every run in the September 2026 logs, the extraction above got no
+        answer at all: the agent never replied to the injected turn, and both
+        calls had ended with the caller mid-sentence - a turn the agent was
+        presumably still waiting to see finished. ElevenLabs analyses every
+        conversation after it closes anyway, and on those calls its
+        `transcript_summary` held exactly what the caller had said. So once the
+        socket is shut, that summary becomes the record's.
+
+        Only the summary is taken, never the transcript, so the record stays as
+        minimal as it was designed to be. Callbacks are left alone: what they
+        need recovered is who answered, which a prose summary does not reliably
+        say.
+        """
+        conversation_id = self._record.provider_conversation_id
+        if (self.is_outbound or not conversation_id or not self._caller_turns
+                or not self._cfg.elevenlabs_api_key):
+            return
+        summary = await fetch_transcript_summary(
+            conversation_id, self._cfg.elevenlabs_api_key
+        )
+        if summary:
+            self._record.summary = summary[:600]
+            log.info(
+                "call %s: summary taken from ElevenLabs' post-call analysis",
+                self._record.call_sid,
+            )
+        else:
+            log.warning(
+                "call %s: no post-call analysis from ElevenLabs either",
+                self._record.call_sid,
             )
 
     # -- plumbing ----------------------------------------------------------

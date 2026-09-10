@@ -270,6 +270,20 @@ class Config:
     callback_max_per_hour: int = field(
         default_factory=lambda: _int("CALLBACK_MAX_PER_HOUR", 6)
     )
+    # A callback can land on a switchboard: a menu, a receptionist, a queue. It
+    # gets longer than an inbound call to get through that, and may sit quietly
+    # on hold for this long before the silence guard gives up on it.
+    callback_max_call_seconds: int = field(
+        default_factory=lambda: _int("CALLBACK_MAX_CALL_SECONDS", 480)
+    )
+    callback_hold_max_s: int = field(
+        default_factory=lambda: _int("CALLBACK_HOLD_MAX_S", 180)
+    )
+    # Keypad presses allowed in one callback. A real menu tree is a handful; the
+    # ceiling bounds a model going round in circles, or being talked into dialling.
+    callback_max_key_presses: int = field(
+        default_factory=lambda: _int("CALLBACK_MAX_KEY_PRESSES", 10)
+    )
 
     # --- Transfer ------------------------------------------------------------
     # Putting a caller through to the owner's mobile. Off by default; when off the
