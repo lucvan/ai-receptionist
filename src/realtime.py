@@ -13,6 +13,9 @@ has three habits worth knowing about before changing anything:
   explicitly ask for a new response, so every tool result is followed by one.
 - **Turn-taking is ours to enforce.** Server VAD tells us the caller started
   talking; truncating the item they stopped hearing is on us.
+- **Reasoning models narrate.** `gpt-realtime-2` and later speak a "commentary"
+  line before a tool call or an answer. We already prompt for speech after every
+  tool, so that line is never played to the caller.
 
 ElevenLabs, in `elevenlabs.py`, does the opposite of all three.
 """
@@ -39,6 +42,7 @@ OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 # realtime API emits a lot of chatter and reacting to more of it than necessary is
 # how these bridges become unmaintainable.
 EVT_AUDIO_DELTA = "response.output_audio.delta"
+EVT_ITEM_ADDED = "response.output_item.added"
 EVT_SPEECH_STARTED = "input_audio_buffer.speech_started"
 EVT_RESPONSE_DONE = "response.done"
 EVT_RESPONSE_CREATED = "response.created"
@@ -80,6 +84,11 @@ class CallBridge(BaseBridge):
         # that keeps calling tools without speaking could spin. Reset whenever the
         # caller talks; a burst larger than this is a loop, not a conversation.
         self._tool_turns_since_caller = 0
+        # Spoken items the model marked as commentary rather than its answer:
+        # "let me note that down" ahead of a tool call, "I'll keep this brief"
+        # ahead of the reply itself. Played out, the caller hears every reply
+        # twice over, so their audio is dropped.
+        self._commentary_items: set[str] = set()
 
     @property
     def _openai(self) -> ClientConnection | None:
@@ -223,9 +232,16 @@ class CallBridge(BaseBridge):
                 etype = event.get("type")
 
                 if etype == EVT_AUDIO_DELTA:
+                    if event.get("item_id") in self._commentary_items:
+                        continue
                     if event.get("item_id"):
                         self._last_assistant_item = event["item_id"]
                     await self._forward_audio(event.get("delta", ""))
+
+                elif etype == EVT_ITEM_ADDED:
+                    item = event.get("item") or {}
+                    if item.get("phase") == "commentary" and item.get("id"):
+                        self._commentary_items.add(item["id"])
 
                 elif etype == EVT_SPEECH_STARTED:
                     self._note_caller_turn()
@@ -315,6 +331,19 @@ class CallBridge(BaseBridge):
         if status == "completed" and not outputs and not self._ending:
             log.warning(
                 "call %s produced an empty response - caller heard silence",
+                self._record.call_sid,
+            )
+
+        # Commentary is dropped on the way to the caller, so a response made of
+        # nothing else is silence too.
+        if (
+            status == "completed"
+            and outputs
+            and all(i.get("phase") == "commentary" for i in outputs)
+            and not self._ending
+        ):
+            log.warning(
+                "call %s response was commentary only - caller heard silence",
                 self._record.call_sid,
             )
 
