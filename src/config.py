@@ -41,8 +41,8 @@ class Config:
     )
 
     # --- Voice provider ------------------------------------------------------
-    # Which service actually answers the phone: "openai" (Realtime) or
-    # "elevenlabs" (Agents). Everything downstream of the call - the tools, the
+    # Which service actually answers the phone: "openai" (Realtime), "gpt-live"
+    # (OpenAI GPT-Live) or "elevenlabs" (Agents). Everything downstream of the call - the tools, the
     # record, the supervisor, the notification channels, callbacks, transfers -
     # is identical either way, so this is a swap of the voice, the turn-taking
     # and the billing, not of what the receptionist does.
@@ -68,6 +68,19 @@ class Config:
     )
     openai_voice: str = field(
         default_factory=lambda: os.environ.get("OPENAI_VOICE", "marin")
+    )
+    # GPT-Live (VOICE_PROVIDER=gpt-live). Same key as Realtime, different API:
+    # a full-duplex voice model, with a text model behind it that holds the tools.
+    openai_live_model: str = field(
+        default_factory=lambda: os.environ.get("OPENAI_LIVE_MODEL", "gpt-live-1")
+    )
+    openai_live_voice: str = field(
+        default_factory=lambda: os.environ.get("OPENAI_LIVE_VOICE", "marin")
+    )
+    openai_live_backend_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "OPENAI_LIVE_BACKEND_MODEL", "gpt-6-luna"
+        )
     )
     # How readily the agent decides the caller has finished speaking.
     # "low" waits longer and interrupts less; "high" replies faster.
@@ -365,7 +378,7 @@ class Config:
             if not self.elevenlabs_api_key:
                 return False, "no API key"
             return True, ""
-        if name == "openai":
+        if name in ("openai", "gpt-live"):
             if not self.openai_api_key:
                 return False, "no API key"
             return True, ""
@@ -381,6 +394,8 @@ class Config:
         """
         if self.voice_provider == "elevenlabs":
             return f"elevenlabs:{self.elevenlabs_agent_id or 'unset'}"
+        if self.voice_provider == "gpt-live":
+            return f"{self.openai_live_model}+{self.openai_live_backend_model}"
         return self.openai_realtime_model
 
     @property

@@ -1110,6 +1110,16 @@ def build_admin_app(
                 + '</code>. Pick them in the <a href="/setup/voice">setup wizard</a>, '
                 + "which reads the live list from your account.</p>"
             )
+        if cfg.voice_provider == "gpt-live":
+            return (
+                _select("Voice", "openai_live_voice", cfg.openai_live_voice,
+                        CHOICES["openai_live_voice"])
+                + '<p class="hint">GPT-Live decides for itself when to speak, so '
+                + "there is no turn-taking setting. Model "
+                + f"<code>{_esc(cfg.openai_live_model)}</code>, with "
+                + f"<code>{_esc(cfg.openai_live_backend_model)}</code> holding "
+                + "the tools.</p>"
+            )
         return (
             '<div class="two">'
             + _select("Voice", "openai_voice", cfg.openai_voice,

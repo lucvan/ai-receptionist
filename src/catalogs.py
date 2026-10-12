@@ -55,6 +55,13 @@ OPENAI_VOICES = (
     "sage", "shimmer", "verse", "marin", "cedar",
 )
 
+# GPT-Live has its own voices, published the same way. `marin` is its default
+# and the only name shared with Realtime.
+OPENAI_LIVE_VOICES = (
+    "marin", "quartz", "ripple", "vesper", "willow", "stone",
+    "gleam", "meridian", "beacon", "delta", "cinder",
+)
+
 
 def _get(url: str, headers: dict[str, str], timeout: int = 20) -> tuple[int, str]:
     request = urllib.request.Request(url, headers=headers, method="GET")

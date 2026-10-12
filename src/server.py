@@ -26,6 +26,7 @@ from .notify import NotifierSet, format_fallback
 from .outbound import OutboundCaller
 from .pending import CallbackStore, PendingCall, PendingStore
 from .elevenlabs import ElevenLabsBridge
+from .gptlive import GPTLiveBridge
 from .persona import Persona, render
 from .realtime import CallBridge
 from .supervisor import SupervisorClient
@@ -112,6 +113,7 @@ transfers = CallbackStore(config.log_dir / "pending-transfers.json")
 # more than one - everything downstream reads a record and cannot tell.
 BRIDGES: dict[str, type[BaseBridge]] = {
     "openai": CallBridge,
+    "gpt-live": GPTLiveBridge,
     "elevenlabs": ElevenLabsBridge,
 }
 

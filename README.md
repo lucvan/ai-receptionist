@@ -308,9 +308,16 @@ overlay only applies where a value has actually been set.
 
 ## Voice provider
 
-`VOICE_PROVIDER` picks what answers the phone: `openai` (Realtime) or
-`elevenlabs` (Agents). Both speak G.711 μ-law at 8 kHz, so audio is relayed to
-Twilio without transcoding either way.
+`VOICE_PROVIDER` picks what answers the phone: `openai` (Realtime), `gpt-live`
+(OpenAI GPT-Live) or `elevenlabs` (Agents). All three speak G.711 μ-law at 8 kHz,
+so audio is relayed to Twilio without transcoding either way.
+
+`gpt-live` uses the same OpenAI key over a different API. The voice model is full
+duplex - it listens while it speaks and decides for itself when to talk - and it
+does not call tools: a text model behind it (`OPENAI_LIVE_BACKEND_MODEL`) is
+handed the conversation and the tools, and the voice model delegates to it. See
+`src/gptlive.py`. It is billed per minute of call plus the backend's tokens, and
+its voices are a different list from Realtime's.
 
 Everything downstream is the same code: the same five tools, the same
 `CallRecord`, the same supervisor, notification channels, routing, caller

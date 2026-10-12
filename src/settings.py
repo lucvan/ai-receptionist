@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .catalogs import OPENAI_VOICES
+from .catalogs import OPENAI_LIVE_VOICES, OPENAI_VOICES
 from .secrets_store import SECRET_KEYS
 
 log = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ log = logging.getLogger(__name__)
 CHOICES: dict[str, list[tuple[str, str]]] = {
     "voice_provider": [
         ("openai", "OpenAI Realtime"),
+        ("gpt-live", "OpenAI GPT-Live"),
         ("elevenlabs", "ElevenLabs Agents"),
     ],
     # OpenAI publishes its voice list in documentation and nowhere
@@ -58,6 +59,7 @@ CHOICES: dict[str, list[tuple[str, str]]] = {
     # the only dropdown in the wizard that is not read from the live account -
     # see `catalogs.py`, which does the rest.
     "openai_voice": [(v, v.capitalize()) for v in OPENAI_VOICES],
+    "openai_live_voice": [(v, v.capitalize()) for v in OPENAI_LIVE_VOICES],
     # A fallback for the pre-key state only. Once a key is saved the wizard lists
     # what the account actually has, which is how it should be: this literal was
     # already two models out of date against a real account the day it was
@@ -87,6 +89,7 @@ BEHAVIOUR_KEYS: dict[str, type] = {
     "openai_voice": str,
     "openai_realtime_model": str,
     "vad_eagerness": str,
+    "openai_live_voice": str,
     # ElevenLabs equivalents. The rest of what shapes a call there - turn-taking,
     # the LLM, the system voice settings - belongs to the agent object and is
     # edited in the ElevenLabs dashboard.
