@@ -190,6 +190,36 @@ def test_finite_settings_render_as_dropdowns_not_text_boxes(env, tmp_path):
         assert f'<input type="text" name="{name}"' not in body, name
 
 
+def test_the_model_dropdown_is_read_from_the_account(env, tmp_path, monkeypatch):
+    """The static list goes stale; a model picked from the account must show
+    up here, and saving it here must stick."""
+    import src.admin
+
+    monkeypatch.setattr(
+        src.admin, "openai_realtime_models",
+        lambda key: ["gpt-realtime-2.1-mini", "gpt-realtime-2.1"],
+    )
+    client, cfg = _admin(env, tmp_path, VOICE_PROVIDER="openai", OPENAI_API_KEY="sk-x",
+                         OPENAI_REALTIME_MODEL="gpt-realtime-2.1")
+    body = client.get("/settings").text
+    assert '<option value="gpt-realtime-2.1" selected>' in body
+    assert "not a known value" not in body
+
+    client.post(
+        "/settings/behaviour",
+        data={"greeting": "x", "openai_realtime_model": "gpt-realtime-2.1-mini"},
+        follow_redirects=False,
+    )
+    assert cfg.config.openai_realtime_model == "gpt-realtime-2.1-mini"
+
+    client.post(
+        "/settings/behaviour",
+        data={"greeting": "x", "openai_realtime_model": "gpt-not-on-the-account"},
+        follow_redirects=False,
+    )
+    assert cfg.config.openai_realtime_model == "gpt-realtime-2.1-mini"
+
+
 def test_a_hand_crafted_post_cannot_write_an_unknown_dropdown_value(env, tmp_path):
     """The form cannot produce this, so it only guards a forged POST - but the
     cost of accepting it is silence on a live call."""

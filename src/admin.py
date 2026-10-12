@@ -12,6 +12,7 @@ There is no user database and no registration - one shared secret, one person.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import html
@@ -24,6 +25,7 @@ from urllib.parse import quote_plus
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from .catalogs import openai_realtime_models
 from .contacts import Contact, normalise
 from .history import CallHistory, _humanise_age
 from .notify import build_bridge
@@ -1079,7 +1081,18 @@ def build_admin_app(
             + (f'<p class="hint">{_esc(hint)}</p>' if hint else "")
         )
 
-    def _voice_fields() -> str:
+    async def _openai_models() -> list[str]:
+        """Realtime models on the account; empty with no key or no answer.
+
+        Read live for the same reason the wizard does: the static list was two
+        models behind a real account the day it was written, and a page that
+        offers only those cannot show, or keep, a model chosen anywhere else.
+        """
+        if cfg is None or cfg.voice_provider != "openai" or not cfg.openai_api_key:
+            return []
+        return await asyncio.to_thread(openai_realtime_models, cfg.openai_api_key)
+
+    def _voice_fields(live_models: list[str]) -> str:
         """The provider-specific knobs, for whichever provider is running.
 
         Showing both sets at once would be worse than showing the wrong one:
@@ -1105,10 +1118,15 @@ def build_admin_app(
                       CHOICES["vad_eagerness"])
             + "</div>"
             + _select("Model", "openai_realtime_model", cfg.openai_realtime_model,
-                      CHOICES["openai_realtime_model"])
+                      [(m, m) for m in live_models]
+                      or CHOICES["openai_realtime_model"],
+                      f"{len(live_models)} Realtime models on this account."
+                      if live_models
+                      else "Could not read the model list from OpenAI; showing "
+                      "the built-in defaults.")
         )
 
-    def _behaviour_card() -> str:
+    def _behaviour_card(live_models: list[str]) -> str:
         return (
             '<form method="post" action="/settings/behaviour"><div class="card">'
             '<div class="head"><span class="title">How it handles a call</span>'
@@ -1116,7 +1134,7 @@ def build_admin_app(
             '<div class="pad">'
             + '<label class="field"><span>Greeting (spoken verbatim to an unknown caller)</span>'
             + f'<textarea name="greeting">{_esc(cfg.greeting)}</textarea></label>'
-            + _voice_fields()
+            + _voice_fields(live_models)
             + '<div class="two">'
             + _field("Wrap up after (seconds)", "wrap_up_after_s", cfg.wrap_up_after_s)
             + _field("Wrap up after (caller turns)", "wrap_up_after_turns",
@@ -1185,7 +1203,8 @@ def build_admin_app(
             + "<h2>Setup</h2>" + _wizard_card()
             + "<h2>Channels</h2>" + cards
             + "<h2>Routing</h2>" + _routing_card(live)
-            + "<h2>Call handling</h2>" + _behaviour_card(),
+            + "<h2>Call handling</h2>"
+            + _behaviour_card(await _openai_models()),
             here="settings",
         )
 
@@ -1259,6 +1278,11 @@ def build_admin_app(
             return RedirectResponse("/settings", status_code=303)
 
         form = await request.form()
+        # The dropdown is filled from the account, so a model has to be checked
+        # against the account too - not only the static fallback.
+        known = {key: set(dict(options)) for key, options in CHOICES.items()}
+        if "openai_realtime_model" in form:
+            known["openai_realtime_model"] |= set(await _openai_models())
         # Seeded from what is already saved rather than started empty, because
         # this form no longer renders every behaviour key: the voice fields are
         # whichever pair matches VOICE_PROVIDER. Replacing the block wholesale
@@ -1284,7 +1308,7 @@ def build_admin_app(
                 except ValueError:
                     # Leave the previous value rather than writing a broken one.
                     continue
-            elif key in CHOICES and raw and raw not in dict(CHOICES[key]):
+            elif key in known and raw and raw not in known[key]:
                 # The form renders these as dropdowns, so this only fires on a
                 # hand-crafted POST. Rejected rather than stored: an unknown
                 # voice or eagerness value does not fail here, it fails on a live
