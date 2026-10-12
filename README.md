@@ -314,10 +314,13 @@ so audio is relayed to Twilio without transcoding either way.
 
 `gpt-live` uses the same OpenAI key over a different API. The voice model is full
 duplex - it listens while it speaks and decides for itself when to talk - and it
-does not call tools: a text model behind it (`OPENAI_LIVE_BACKEND_MODEL`) is
-handed the conversation and the tools, and the voice model delegates to it. See
-`src/gptlive.py`. It is billed per minute of call plus the backend's tokens, and
-its voices are a different list from Realtime's.
+does not call tools. A text model (`OPENAI_LIVE_BACKEND_MODEL`) runs beside it as
+a record-keeper: after each thing the caller says it is shown the transcript and
+calls the tools, including the one that ends the call. See `src/gptlive.py` for
+why it is not attached to the voice session. It is billed per minute of call
+plus the record-keeper's tokens, and its voices are a different list from
+Realtime's. Every GPT-Live call logs a timeline of who spoke when;
+`CALL_DEBUG_LOG=true` adds what was said.
 
 Everything downstream is the same code: the same five tools, the same
 `CallRecord`, the same supervisor, notification channels, routing, caller

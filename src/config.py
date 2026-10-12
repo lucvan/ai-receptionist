@@ -82,6 +82,12 @@ class Config:
             "OPENAI_LIVE_BACKEND_MODEL", "gpt-6-luna"
         )
     )
+    # Writes what each side said into the log, alongside the timings that are
+    # always there. For chasing a problem on a test call: it puts the content of
+    # calls in the container log, so turn it off again afterwards.
+    call_debug_log: bool = field(
+        default_factory=lambda: _bool("CALL_DEBUG_LOG", False)
+    )
     # How readily the agent decides the caller has finished speaking.
     # "low" waits longer and interrupts less; "high" replies faster.
     vad_eagerness: str = field(

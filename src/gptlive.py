@@ -3,26 +3,29 @@
 A different API from `realtime.py`, not a newer model on the same one. GPT-Live
 is full duplex: it listens while it speaks and decides for itself when to talk,
 so there is no turn detection to configure, no response to request after the
-caller stops, and no barge-in to enforce. What it does not do is call tools. A
-second, text-only model - the *backend* - is handed the conversation and the
-tools, and GPT-Live decides when to ask it for help ("delegation").
+caller stops, and no barge-in to enforce. What it does not do is call tools.
 
-That split is the shape of this file, and it has four habits worth knowing:
+OpenAI's answer to that is "delegation": a second, text-only model is attached
+to the session and the voice model hands it work. It is not used here, and the
+reason is the shape of this file. Attached to the session, the backend changes
+how the voice model talks - it stops and says "just a moment" when it delegates,
+and while the backend is running in the background it answers the caller with
+little more than "mm-hm". Both were heard on real calls.
 
-- **The bridge runs the backend, not the voice model.** Left to delegate, the
-  voice model stops and says "just a moment" each time, and then forgets to ask
-  when the caller says goodbye. So it is told not to, and the bridge sets the
-  backend going itself after each thing the caller says.
-- **Two prompts.** The voice model gets the receptionist prompt plus a note
-  that the record is kept for it. The backend gets the same prompt - it has to know what may
-  never be said, since the voice model may speak whatever it replies - plus a
-  note that it is the record-keeper and the caller cannot hear it.
-- **Audio arrives at the pace it is spoken**, silence included. So nothing is
-  ever queued far ahead in Twilio, and there is no end-of-response event: "the
-  agent has finished speaking" is measured off the audio itself.
-- **The backend's events arrive wrapped.** A tool call is a
-  `response.output_item.done` inside a `response.event` envelope, answered with
-  `response.item.create` and then `response.create` to let the backend go on.
+So the two halves are kept apart:
+
+- **The voice session only talks.** It gets the receptionist prompt and a note
+  that the record is kept for it. Nothing else is attached to it.
+- **A record-keeper runs beside it**, as plain Responses API calls of our own.
+  After each thing the caller says it is shown the transcript so far and what
+  is already recorded, and calls whichever tools apply - including ending the
+  call. It never touches the voice session, so it cannot make the caller wait.
+
+Two more habits of this API worth knowing:
+
+- **Audio arrives at the pace it is spoken**, silence included. Nothing is ever
+  queued far ahead in Twilio, and there is no end-of-response event: "the agent
+  has finished speaking" is measured off the audio itself.
 - **Nothing happens before `session.started`.** Caller audio sent earlier is an
   error, so it is dropped until then.
 
@@ -38,31 +41,26 @@ import logging
 import time
 from typing import Any
 
+import httpx
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from .bridge import BaseBridge
+from .bridge import CALLER_AUDIO_ACTIVE_LEVEL, BaseBridge
 from .tools import tool_specs
 from .ulaw import mean_level
 
 log = logging.getLogger(__name__)
 
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
 EVT_STARTED = "session.started"
 EVT_AUDIO_DELTA = "session.output_audio.delta"
 EVT_INPUT_TRANSCRIPT = "session.input_transcript.delta"
 EVT_OUTPUT_TRANSCRIPT = "session.output_transcript.delta"
-EVT_BACKEND = "response.event"
 EVT_DELEGATED = "session.delegation.created"
 EVT_CLOSED = "session.closed"
 EVT_ERROR = "error"
-
-# Inside a `response.event` envelope.
-BACKEND_CREATED = "response.created"
-BACKEND_ITEM_DONE = "response.output_item.done"
-BACKEND_COMPLETED = "response.completed"
-BACKEND_FAILED = "response.failed"
 
 # Agent audio louder than this is speech, on the scale `ulaw.mean_level` uses.
 # The stream never stops, so quiet frames are how a finished sentence looks.
@@ -72,16 +70,17 @@ AGENT_SPEAKING_LEVEL = 300.0
 # There is no end-of-turn event; the guards only need a rough count.
 CALLER_TURN_GAP_S = 1.5
 
-# Ceiling on backend tool calls between caller turns, to bound a tool loop. See
-# the same constant in `realtime.py` for why it sits above four.
-MAX_TOOL_CALLS_PER_CALLER_TURN = 8
+# A gap in either side's audio longer than this is the end of something said,
+# for the timeline in the log.
+UTTERANCE_GAP_S = 0.7
 
 # How long whoever answers a callback is given to speak first.
 OUTBOUND_OPENING_WAIT_S = 3.0
 
 # How long after the caller's transcript stops the record-keeper is asked to
-# look at what they said.
+# look at what they said, and how long it is given to answer.
 RECORD_AFTER_QUIET_S = 1.0
+RECORD_TIMEOUT_S = 20.0
 
 # A hang-up waits for the caller to have been quiet this long, and is called off
 # if they say anything in the meantime.
@@ -99,24 +98,25 @@ VOICE_NOTE = """
 
 ## How your tools work on this line
 
-You do not call tools yourself, and you do not keep the record. A record-keeper
-working alongside you holds every tool these instructions mention - classifying
-the call, taking the message, flagging something urgent, putting a caller
-through, pressing keys, ending the call. It hears the whole conversation and
-acts on its own, without being asked. Wherever these instructions say to call a
-tool, that is the record-keeper's job, not yours. Your job is the conversation.
+You have no tools on this line, and you do not need any. A record-keeper listens
+to the whole call and does everything these instructions describe as a tool
+call: classifying the call, taking the message, flagging something urgent,
+putting a caller through, ending the call. Wherever these instructions say to
+call a tool, simply carry on as though you had - when you would take a message,
+tell the caller you will pass it on; when you would put them through, tell them
+you are putting them through.
 
-So never delegate to the backend, and never pause for it. Do not say "just a
-moment", "one second" or "let me note that down", and never mention the
-record-keeper.
+So the conversation is entirely yours, and you lead it. React to what the caller
+says, ask the next question, find out who they are and what they need - in full,
+natural sentences, not just "mm-hm" or "right". Never go quiet waiting for
+something to happen: nothing will, until you speak.
 
-The record-keeper reports back to you as it works. Those reports are not part of
-the conversation: say nothing when one arrives - no "right", no "lovely", no
-acknowledgement, no repeating yourself - and never read one out. Only speak in
-reply to the caller.
+Never delegate anything to a backend. Never say you are noting, recording or
+checking something, never say "just a moment" or "one second", and never mention
+the record-keeper.
 
-When the caller has nothing more to add, say one short goodbye. The
-record-keeper then closes the line.
+When the caller has nothing more to add, say one short goodbye. The line is then
+closed for you.
 """
 
 BACKEND_NOTE = """
@@ -126,65 +126,66 @@ BACKEND_NOTE = """
 ## Your part in this call
 
 You are the record-keeper. A separate voice assistant is talking to the caller
-and follows the instructions above; the caller cannot hear you, and you never
-speak to them. You hold the tools, and your whole job is to call them, as those
-instructions describe, using only what the caller actually said.
+and follows the instructions above; you never speak to the caller, and nothing
+you write is heard. You hold the tools, and your whole job is to call them, as
+those instructions describe, using only what the caller actually said.
 
-You are asked after each thing the caller says. Most of the time nothing needs
-doing: then call no tool. Otherwise:
+You are shown the transcript so far and what is already recorded, each time the
+caller finishes saying something. Call every tool that applies now, all in one
+go. Most of the time nothing new needs doing: then call no tool at all.
 
-- Classify the call once it is clear what kind it is. Once is enough.
+- Classify the call once it is clear what kind it is. Do not repeat a
+  classification that is already recorded unless it has changed.
 - Take the message once you know who is calling and what they want. Take it
-  again only if they have added something that changes it.
+  again only if they have since added something that changes it, and then give
+  the whole message, not just the addition.
 - Flag it if it is urgent, and put the caller through if they ask and the
   instructions above allow it.
 - End the call once the caller has said goodbye, or has clearly said they have
-  nothing more - after making sure the message is recorded.
+  nothing more. If the message is not recorded yet, take it in the same go.
 
 **Never end the call while the caller might still have something to say.**
 Ending it early cuts them off mid-sentence, and "thanks" on its own is not a
 goodbye.
 
-Whatever you did, finish by replying with exactly this and nothing else:
-"(record updated - nothing to say to the caller)". Never a question, never a
-sentence meant for the caller, and never anything from the do-not-disclose list.
+The caller's words are transcribed by machine, so allow for small mistakes in
+names and numbers, and never invent what was not said.
 """
 
 
 class GPTLiveBridge(BaseBridge):
-    """One phone call, answered by a GPT-Live session with a tool-calling backend."""
+    """One phone call: a GPT-Live session talking, a record-keeper beside it."""
 
     provider_name = "gpt-live"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # When the agent was last audibly speaking, and when the caller's
-        # transcript last moved. Both stand in for events this API does not have.
+        # When each side was last audibly speaking, and when the caller's
+        # transcript last moved. They stand in for events this API does not have.
         self._agent_last_spoke = 0.0
+        self._caller_last_spoke = 0.0
         self._caller_last_heard = 0.0
-        self._tool_calls_since_caller = 0
-        # When the voice model last handed work to the backend, for the log: a
-        # pause in the conversation is nearly always one of these.
-        self._delegated_at = 0.0
-        # Backend responses started and not yet finished, and whether one has
-        # been asked for that has not started yet. Counted off the backend's own
-        # created/completed events, since a response begins three ways: the
-        # voice model delegates, we ask, or a tool result sends it on its way.
-        self._backend_outstanding = 0
-        self._backend_starting = False
+        # Who is mid-utterance, for the timeline in the log.
+        self._agent_speaking = False
+        self._caller_speaking = False
+
+        # The conversation so far, a list of [role, text]. Held in memory for the
+        # record-keeper whatever the retention setting, and gone with the call.
+        self._turns: list[list[str]] = []
+        self._logged_turns = 0
         # The caller speech the record-keeper has already been asked about.
         self._recorded_up_to = 0.0
         # The one task that plays out the goodbye and then hangs up.
         self._finisher: asyncio.Task | None = None
 
     @property
-    def _backend_busy(self) -> bool:
-        return self._backend_starting or self._backend_outstanding > 0
-
-    @property
     def _live(self) -> ClientConnection | None:
         return self._provider
+
+    def _t(self) -> str:
+        """Seconds into the call, for the timeline."""
+        return f"{time.monotonic() - self._started:5.1f}s"
 
     # -- session -----------------------------------------------------------
 
@@ -209,21 +210,6 @@ class GPTLiveBridge(BaseBridge):
             + f"\n## Before every word you say\n\n{accent}\n"
         )
 
-    def _backend_config(self) -> dict[str, Any]:
-        return {
-            "model": self._cfg.openai_live_backend_model,
-            "instructions": self._session_instructions() + BACKEND_NOTE,
-            # Transfer is only offered on inbound calls, and only when enabled.
-            # A callback must never be able to patch someone through.
-            "tools": tool_specs(self._transfer_available(), outbound=self.is_outbound),
-            "tool_choice": "auto",
-            # One call at a time: each result is acted on before the next.
-            "parallel_tool_calls": False,
-            # Filing a message is not a hard problem, and the caller is waiting
-            # on the hang-up while it is thought about.
-            "reasoning": {"effort": "low"},
-        }
-
     async def _configure_session(self) -> None:
         await self._send_live(
             {
@@ -238,10 +224,6 @@ class GPTLiveBridge(BaseBridge):
                     # No recording kept at OpenAI: what a call was about lives in
                     # the call record here, and nowhere else.
                     "store": False,
-                    "delegation": {
-                        "type": "responses",
-                        "responses": self._backend_config(),
-                    },
                 },
             }
         )
@@ -290,6 +272,15 @@ class GPTLiveBridge(BaseBridge):
     async def _send_caller_audio(self, payload_b64: str) -> None:
         if not self._session_ready.is_set():
             return
+        if mean_level(base64.b64decode(payload_b64)) > CALLER_AUDIO_ACTIVE_LEVEL:
+            now = time.monotonic()
+            if not self._caller_speaking:
+                self._caller_speaking = True
+                log.info(
+                    "call %s %s caller started speaking", self._record.call_sid,
+                    self._t(),
+                )
+            self._caller_last_spoke = now
         await self._send_live(
             {"type": "session.input_audio.append", "audio": payload_b64}
         )
@@ -311,22 +302,26 @@ class GPTLiveBridge(BaseBridge):
                     self._handle_caller_transcript(event.get("delta", ""))
 
                 elif etype == EVT_OUTPUT_TRANSCRIPT:
-                    self._keep_transcript("agent", event.get("delta", ""))
-
-                elif etype == EVT_BACKEND:
-                    await self._handle_backend_event(self._unwrap(event))
-
-                elif etype == EVT_DELEGATED:
-                    self._delegated_at = time.monotonic()
-                    log.info("call %s delegated to backend", self._record.call_sid)
+                    self._add_text("agent", event.get("delta", ""))
 
                 elif etype == EVT_STARTED:
                     log.info("call %s session configured", self._record.call_sid)
                     self._session_ready.set()
 
+                elif etype == EVT_DELEGATED:
+                    # It has no backend to delegate to and is told not to try.
+                    # If it does, the caller is about to hear it wait.
+                    log.warning(
+                        "call %s %s voice model tried to delegate",
+                        self._record.call_sid,
+                        self._t(),
+                    )
+                    await self._instruct(
+                        "There is no backend on this line. Carry on the "
+                        "conversation yourself, now."
+                    )
+
                 elif etype == EVT_ERROR:
-                    # Whatever was refused, nothing is going to start from it.
-                    self._backend_starting = False
                     log.error(
                         "call %s gpt-live error: %s",
                         self._record.call_sid,
@@ -353,33 +348,57 @@ class GPTLiveBridge(BaseBridge):
                 self._finisher.cancel()
             self._closed.set()
 
-    async def _keep_records(self) -> None:
-        """Ask the record-keeper to look, each time the caller stops talking.
-
-        One request at a time: while the backend is working, anything further
-        the caller says is picked up by the next one.
-        """
-        while True:
-            await asyncio.sleep(0.2)
-            heard = self._caller_last_heard
-            if (
-                heard > self._recorded_up_to
-                and time.monotonic() - heard > RECORD_AFTER_QUIET_S
-                and not self._backend_busy
-                and not self._ending
-            ):
-                self._recorded_up_to = heard
-                await self._continue_backend()
-
     async def _handle_agent_audio(self, delta_b64: str) -> None:
         if not delta_b64:
             return
+        now = time.monotonic()
         if mean_level(base64.b64decode(delta_b64)) > AGENT_SPEAKING_LEVEL:
-            now = time.monotonic()
+            if not self._agent_speaking:
+                self._agent_speaking = True
+                self._log_agent_started(now)
             self._agent_last_spoke = now
             # The agent talking is not dead air, however long it goes on.
             self._last_activity = now
         await self._forward_audio(delta_b64)
+
+    def _log_agent_started(self, now: float) -> None:
+        """The line the timeline exists for: how long the caller waited."""
+        if self._caller_last_spoke:
+            waited = now - self._caller_last_spoke
+            log.info(
+                "call %s %s agent started speaking, %.1fs after the caller stopped",
+                self._record.call_sid,
+                self._t(),
+                waited,
+            )
+        else:
+            log.info(
+                "call %s %s agent started speaking", self._record.call_sid, self._t()
+            )
+
+    def _note_quiet(self) -> None:
+        """Close off whatever either side has finished saying, in the log."""
+        now = time.monotonic()
+        sid = self._record.call_sid
+        if self._agent_speaking and now - self._agent_last_spoke > UTTERANCE_GAP_S:
+            self._agent_speaking = False
+            log.info("call %s %s agent stopped speaking", sid, self._t())
+        if self._caller_speaking and now - self._caller_last_spoke > UTTERANCE_GAP_S:
+            self._caller_speaking = False
+            log.info("call %s %s caller stopped speaking", sid, self._t())
+        self._log_finished_turns()
+
+    def _log_finished_turns(self, everything: bool = False) -> None:
+        """What was said, when asked for. Off by default: it is the call itself."""
+        if not self._cfg.call_debug_log:
+            return
+        upto = len(self._turns) if everything else len(self._turns) - 1
+        for role, text in self._turns[self._logged_turns:max(upto, 0)]:
+            log.info(
+                "call %s        %s said: %s", self._record.call_sid, role,
+                text.strip(),
+            )
+        self._logged_turns = max(self._logged_turns, upto, 0)
 
     def _handle_caller_transcript(self, delta: str) -> None:
         if not delta.strip():
@@ -387,112 +406,143 @@ class GPTLiveBridge(BaseBridge):
         now = time.monotonic()
         if now - self._caller_last_heard > CALLER_TURN_GAP_S:
             self._note_caller_turn()
-            self._tool_calls_since_caller = 0
         self._caller_last_heard = now
         self._last_activity = now
-        self._keep_transcript("caller", delta)
+        self._add_text("caller", delta)
 
-    def _keep_transcript(self, role: str, delta: str) -> None:
-        """Fragments, joined per speaker. Kept only when retention is on."""
-        if not self._cfg.retain_transcripts or not delta:
+    def _add_text(self, role: str, delta: str) -> None:
+        """Transcript fragments, joined per speaker."""
+        if not delta:
             return
-        transcript = self._record.transcript
-        if transcript and transcript[-1].get("role") == role:
-            transcript[-1]["text"] += delta
+        if self._turns and self._turns[-1][0] == role:
+            self._turns[-1][1] += delta
         else:
-            transcript.append({"role": role, "text": delta})
+            self._turns.append([role, delta])
+        if self._cfg.retain_transcripts:
+            self._record.transcript = [
+                {"role": r, "text": t.strip()} for r, t in self._turns
+            ]
 
-    @staticmethod
-    def _unwrap(envelope: dict) -> dict:
-        """The backend event inside a `response.event` envelope."""
-        for key in ("response", "event"):
-            inner = envelope.get(key)
-            if isinstance(inner, dict) and inner.get("type"):
-                return inner
-        return {}
+    # -- the record-keeper -------------------------------------------------
 
-    async def _handle_backend_event(self, event: dict) -> None:
-        etype = event.get("type")
+    async def _keep_records(self) -> None:
+        """Ask the record-keeper to look, each time the caller stops talking.
 
-        if etype == BACKEND_CREATED:
-            self._backend_starting = False
-            self._backend_outstanding += 1
-            return
-        if etype in (BACKEND_COMPLETED, BACKEND_FAILED):
-            self._backend_outstanding = max(0, self._backend_outstanding - 1)
+        One request at a time: anything the caller says while it is working is
+        picked up by the next one.
+        """
+        while True:
+            await asyncio.sleep(0.2)
+            self._note_quiet()
+            heard = self._caller_last_heard
+            if (
+                heard > self._recorded_up_to
+                and time.monotonic() - heard > RECORD_AFTER_QUIET_S
+                and not self._ending
+            ):
+                self._recorded_up_to = heard
+                await self._record_pass()
 
-        if etype == BACKEND_COMPLETED and self._delegated_at:
-            log.info(
-                "call %s backend finished after %.1fs",
-                self._record.call_sid,
-                time.monotonic() - self._delegated_at,
+    def _record_input(self) -> str:
+        """What the record-keeper is shown: the record so far, then the call."""
+        r = self._record
+        if r.message_taken:
+            message = "; ".join(
+                f"{label}: {value}"
+                for label, value in (
+                    ("caller", r.caller_name),
+                    ("company or relationship", r.company_or_relationship),
+                    ("callback number", r.callback_number),
+                    ("reason", r.reason),
+                    ("requested action", r.requested_action),
+                    ("summary", r.summary),
+                )
+                if value
             )
-            return
-
-        if etype == BACKEND_FAILED:
-            error = (event.get("response") or {}).get("error") or {}
-            log.warning(
-                "call %s backend response failed: %s",
-                self._record.call_sid,
-                error.get("message", "unknown"),
-            )
-            return
-
-        # Only the completed item carries the name and call id together; the
-        # arguments-done event that precedes it has neither.
-        if etype != BACKEND_ITEM_DONE:
-            return
-        item = event.get("item") or {}
-        if item.get("type") == "function_call":
-            await self._dispatch_tool(item)
-
-    # -- tools -------------------------------------------------------------
-
-    async def _dispatch_tool(self, item: dict) -> None:
-        name = item.get("name", "")
-        args = self._parse_arguments(item.get("arguments"))
-
-        self._tool_calls_since_caller += 1
-        if self._tool_calls_since_caller > MAX_TOOL_CALLS_PER_CALLER_TURN:
-            log.warning(
-                "call %s backend made %d tool calls in one turn - refusing more",
-                self._record.call_sid,
-                self._tool_calls_since_caller,
-            )
-            result: dict = {
-                "ok": False,
-                "error": "Too many tool calls. Stop and wait for the caller.",
-            }
         else:
-            result = await self._run_tool(name, args)
-
-        if self.transfer_requested:
-            # Stop the bridge; the server redirects the live call to <Dial>.
-            self._closed.set()
-            return
-
-        await self._send_live(
-            {
-                "type": "response.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": item.get("call_id", ""),
-                    "output": json.dumps(result),
-                },
-            }
+            message = "none yet"
+        speaker = {"agent": "Assistant", "caller": "Caller"}
+        transcript = "\n".join(
+            f"{speaker.get(role, role)}: {text.strip()}" for role, text in self._turns
         )
-        # The backend response is parked until it is told to carry on.
-        await self._continue_backend()
+        return (
+            "## Already recorded\n\n"
+            f"- Kind of call: {r.category}, urgency {r.urgency}\n"
+            f"- Message: {message}\n"
+            f"- Flagged urgent: {'yes' if r.notify_flagged else 'no'}\n\n"
+            "## Transcript so far\n\n"
+            f"{transcript or '(nothing has been said yet)'}"
+        )
+
+    async def _ask_record_keeper(self, body: dict) -> dict:
+        """One Responses API call. Separate so a test can stand in for it."""
+        headers = {"Authorization": f"Bearer {self._cfg.openai_api_key}"}
+        async with httpx.AsyncClient(timeout=RECORD_TIMEOUT_S) as client:
+            response = await client.post(
+                OPENAI_RESPONSES_URL, headers=headers, json=body
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def _record_pass(self, final: bool = False) -> None:
+        """Show the record-keeper the call so far and apply what it decides."""
+        instructions = self._session_instructions() + BACKEND_NOTE
+        if final:
+            instructions += "\n\n" + self._extract_instruction()
+        started = time.monotonic()
+        try:
+            reply = await self._ask_record_keeper(
+                {
+                    "model": self._cfg.openai_live_backend_model,
+                    "instructions": instructions,
+                    "input": self._record_input(),
+                    # Transfer is only offered on inbound calls, and only when
+                    # enabled. A callback must never patch someone through.
+                    "tools": tool_specs(
+                        self._transfer_available(), outbound=self.is_outbound
+                    ),
+                    # With the caller gone, prose is no use: make it record.
+                    "tool_choice": "required" if final else "auto",
+                    "parallel_tool_calls": True,
+                    # Filing a message is not a hard problem.
+                    "reasoning": {"effort": "low"},
+                    "store": False,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "call %s record-keeper failed: %s: %s",
+                self._record.call_sid,
+                type(exc).__name__,
+                exc,
+            )
+            return
+
+        calls = [
+            item
+            for item in reply.get("output") or []
+            if item.get("type") == "function_call"
+        ]
+        log.info(
+            "call %s %s record-keeper took %.1fs: %s",
+            self._record.call_sid,
+            self._t(),
+            time.monotonic() - started,
+            ", ".join(c.get("name", "?") for c in calls) or "nothing to do",
+        )
+        for item in calls:
+            await self._run_tool(
+                item.get("name", ""), self._parse_arguments(item.get("arguments"))
+            )
+            if self.transfer_requested:
+                # Stop the bridge; the server redirects the live call to <Dial>.
+                self._closed.set()
+                return
 
         if self._ending and not self._extracting and self._finisher is None:
             self._finisher = asyncio.create_task(
                 self._finish_call(self._caller_last_heard)
             )
-
-    async def _continue_backend(self) -> None:
-        """Set the backend going: on a tool result, or on the whole call."""
-        await self._send_live({"type": "response.create"})
-        self._backend_starting = True
 
     async def _finish_call(self, asked_at: float) -> None:
         """Let the goodbye play out, then hang up - unless the caller carries on.
@@ -517,10 +567,6 @@ class GPTLiveBridge(BaseBridge):
                     "The call is ending now. Say one short goodbye, such as "
                     '"Thanks for calling, goodbye."'
                 )
-            else:
-                await self._instruct(
-                    "The call is ending now. Say nothing more."
-                )
             started = time.monotonic()
             while time.monotonic() - started < FAREWELL_MAX_S:
                 await asyncio.sleep(0.1)
@@ -533,18 +579,16 @@ class GPTLiveBridge(BaseBridge):
 
             if self._caller_last_heard > asked_at:
                 log.info(
-                    "call %s caller carried on talking - not hanging up",
+                    "call %s %s caller carried on talking - not hanging up",
                     self._record.call_sid,
+                    self._t(),
                 )
                 self._ending = False
                 self._record.end_reason = ""
                 self._finisher = None
                 self._recorded_up_to = asked_at
-                await self._instruct(
-                    "The caller is still talking, so the call is not over. "
-                    "Carry on the conversation."
-                )
                 return
+            log.info("call %s %s hanging up", self._record.call_sid, self._t())
             await self._send_final_mark()
         except asyncio.CancelledError:
             raise
@@ -557,108 +601,33 @@ class GPTLiveBridge(BaseBridge):
             self._closed.set()
 
     async def _nudge_wrap_up_impl(self) -> None:
-        """Tell the voice model to close, and set the record-keeper going."""
+        """Tell the voice model to close. The record-keeper is already watching."""
         await self._instruct(
             "This call is going round in circles and no message has been "
             "recorded. Stop asking questions and say one short closing line."
         )
-        await self._continue_backend()
 
     # -- end-of-call extraction --------------------------------------------
 
     async def _extract_message_if_missing(self) -> None:
         """Recover the message when the record-keeper never took one.
 
-        The caller has gone, but the session still holds the conversation, and
-        the backend can be set going without the voice model asking for it. It
-        is told the call is over and made to use a tool, so it cannot answer in
-        prose. Then the session is closed properly, which is also what stops the
-        per-second billing.
+        Usually because the caller hung up before it had its say. The transcript
+        is still in hand, so it is asked once more - told the call is over, and
+        made to use a tool. Then the session is closed properly, which is also
+        what stops the per-second billing.
         """
+        self._log_finished_turns(everything=True)
         try:
             if self._worth_extracting():
-                await self._extract()
+                log.info(
+                    "call %s ended without a message - extracting one",
+                    self._record.call_sid,
+                )
+                self._extracting = True
+                await self._record_pass(final=True)
         finally:
             await self._close_session()
-
-    async def _extract(self) -> None:
-        self._extracting = True
-        try:
-            # A caller who hangs up straight after "bye" leaves the record-keeper
-            # mid-task. Let it finish what it started before asking again.
-            if self._backend_busy:
-                await self._drain_backend()
-            if self._extraction_complete():
-                return
-
-            log.info(
-                "call %s ended without a message - extracting one",
-                self._record.call_sid,
-            )
-            backend = self._backend_config()
-            backend["instructions"] += "\n\n" + self._extract_instruction()
-            backend["tool_choice"] = "required"
-            await self._send_live(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "delegation": {"type": "responses", "responses": backend}
-                    },
-                }
-            )
-            for _ in range(3):
-                await self._continue_backend()
-                if not await self._drain_backend():
-                    break
-                if self._extraction_complete():
-                    break
-        except (TimeoutError, asyncio.TimeoutError):
-            log.warning(
-                "call %s message extraction timed out", self._record.call_sid
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "call %s message extraction failed: %s",
-                self._record.call_sid,
-                type(exc).__name__,
-            )
-
-    async def _drain_backend(self) -> bool:
-        """Run the backend's tool calls until it has nothing left in flight.
-
-        True if it called any. Stops early once the message is recorded: with
-        the caller gone there is nothing further worth waiting for.
-        """
-        assert self._live is not None
-        dispatched = False
-        async with asyncio.timeout(25):
-            async for raw in self._live:
-                event = json.loads(raw)
-                etype = event.get("type")
-
-                if etype == EVT_ERROR:
-                    log.warning(
-                        "call %s extraction error: %s",
-                        self._record.call_sid,
-                        event.get("error", {}).get("message", "unknown"),
-                    )
-                    self._backend_outstanding = 0
-                    self._backend_starting = False
-                    return dispatched
-                if etype != EVT_BACKEND:
-                    continue
-
-                inner = self._unwrap(event)
-                item = inner.get("item") or {}
-                if (
-                    inner.get("type") == BACKEND_ITEM_DONE
-                    and item.get("type") == "function_call"
-                ):
-                    dispatched = True
-                await self._handle_backend_event(inner)
-                if self._extraction_complete() or not self._backend_busy:
-                    return dispatched
-        return dispatched
 
     async def _close_session(self) -> None:
         """End the session and wait briefly for the provider to confirm it."""

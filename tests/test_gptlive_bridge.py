@@ -1,12 +1,12 @@
 """The GPT-Live bridge: the frames it puts on the wire.
 
-GPT-Live does not call tools; a backend model does, and its events arrive
-wrapped. These cover the places a mistake is silent on a real call: a tool
-result that is never sent back (the backend waits for ever and nothing more is
-recorded), caller audio sent before the session exists (an error per frame), and
-a hang-up that cuts the goodbye off.
+GPT-Live does not call tools; a record-keeper beside it does, over the Responses
+API. These cover the places a mistake is silent on a real call: a backend
+attached to the voice session (the caller is kept waiting), a tool call that is
+never applied (nothing is recorded), caller audio sent before the session exists
+(an error per frame), and a hang-up that cuts the goodbye or the caller off.
 
-Nothing here touches the network; the OpenAI socket is a scripted fake.
+Nothing here touches the network; the socket and the record-keeper are fakes.
 
 Run with `pytest` from the repo root.
 """
@@ -96,38 +96,42 @@ def make_bridge(monkeypatch, events: list[dict]):
     return bridge, twilio, live
 
 
-def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> dict:
+def _calls(*calls: tuple[str, dict]) -> dict:
+    """A Responses API reply carrying these tool calls."""
     return {
-        "type": "response.event",
-        "delegation_id": "item_1",
-        "response": {
-            "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "name": name,
-                "call_id": call_id,
-                "arguments": json.dumps(arguments),
-            },
-        },
+        "output": [
+            {"type": "function_call", "name": name, "arguments": json.dumps(args)}
+            for name, args in calls
+        ]
     }
 
 
+def record_keeper(monkeypatch, bridge, reply: dict) -> list[dict]:
+    """Stand in for the Responses API. Returns the requests it was sent."""
+    asked: list[dict] = []
+
+    async def fake(body: dict) -> dict:
+        asked.append(body)
+        return reply
+
+    monkeypatch.setattr(bridge, "_ask_record_keeper", fake)
+    return asked
+
+
 @pytest.mark.anyio
-async def test_the_session_asks_for_phone_audio_and_gives_the_backend_the_tools(
-    monkeypatch,
-):
+async def test_the_voice_session_has_phone_audio_and_no_backend(monkeypatch):
+    """Attached to the session, a backend makes the voice model stop and wait."""
     bridge, _, live = make_bridge(monkeypatch, [])
     await bridge._configure_session()
 
     session = live.of_type("session.start")[0]["session"]
     assert session["audio"]["format"] == {"type": "audio/pcmu", "rate": 8000}
     assert session["store"] is False
-    backend = session["delegation"]["responses"]
-    assert {t["name"] for t in backend["tools"]} >= {"take_message", "end_call"}
-    # The voice model has no tools; both halves carry the prompt.
+    assert "delegation" not in session
     assert "tools" not in session
     assert "You are a receptionist." in session["instructions"]
-    assert "You are a receptionist." in backend["instructions"]
+    # How to sound is said first and last.
+    assert session["instructions"].count("Speak plainly.") == 2
 
 
 @pytest.mark.anyio
@@ -144,21 +148,54 @@ async def test_caller_audio_waits_for_the_session(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_a_backend_tool_call_is_recorded_and_answered(monkeypatch):
+async def test_the_record_keeper_sees_the_transcript_and_its_tools_are_applied(
+    monkeypatch,
+):
     bridge, _, live = make_bridge(
         monkeypatch,
-        [_tool_call("take_message", {"caller_name": "Dave", "reason": "boiler"})],
+        [
+            {"type": "session.output_transcript.delta", "delta": "Who is calling?"},
+            {"type": "session.input_transcript.delta", "delta": "It's Dave, "},
+            {"type": "session.input_transcript.delta", "delta": "about the boiler."},
+        ],
+    )
+    asked = record_keeper(
+        monkeypatch,
+        bridge,
+        _calls(
+            ("classify_call", {"category": "tradesperson_admin", "urgency": "low"}),
+            ("take_message", {"caller_name": "Dave", "reason": "boiler"}),
+        ),
     )
     await bridge._pump_provider()
+    await bridge._record_pass()
+
+    shown = asked[0]["input"]
+    assert "Assistant: Who is calling?" in shown
+    assert "Caller: It's Dave, about the boiler." in shown
+    assert "Message: none yet" in shown
+    assert {t["name"] for t in asked[0]["tools"]} >= {"take_message", "end_call"}
+    assert asked[0]["store"] is False
 
     assert bridge._record.message_taken
     assert bridge._record.caller_name == "Dave"
-    output = live.of_type("response.item.create")[0]["item"]
-    assert output["type"] == "function_call_output"
-    assert output["call_id"] == "call_1"
-    assert json.loads(output["output"]) == {"ok": True}
-    # Without this the backend response stays parked on the tool result.
-    assert live.of_type("response.create") == [{"type": "response.create"}]
+    assert bridge._record.category == "tradesperson_admin"
+    # Nothing about it reaches the voice session.
+    assert live.sent == []
+
+
+@pytest.mark.anyio
+async def test_a_failing_record_keeper_does_not_end_the_call(monkeypatch):
+    bridge, _, _ = make_bridge(monkeypatch, [])
+
+    async def boom(body: dict) -> dict:
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(bridge, "_ask_record_keeper", boom)
+    await bridge._record_pass()
+
+    assert not bridge._closed.is_set()
+    assert not bridge._record.message_taken
 
 
 @pytest.mark.anyio
@@ -178,13 +215,15 @@ async def test_agent_audio_reaches_twilio(monkeypatch):
 
 @pytest.mark.anyio
 async def test_end_call_hangs_up_only_after_the_goodbye(monkeypatch):
+    monkeypatch.setattr(gptlive, "CALLER_DONE_QUIET_S", 0.0)
     monkeypatch.setattr(gptlive, "FAREWELL_START_S", 0.0)
     monkeypatch.setattr(gptlive, "FAREWELL_QUIET_S", 0.0)
     bridge, twilio, live = make_bridge(monkeypatch, [])
-
-    await bridge._dispatch_tool(
-        _tool_call("end_call", {"reason": "message_taken"})["response"]["item"]
+    record_keeper(
+        monkeypatch, bridge, _calls(("end_call", {"reason": "message_taken"}))
     )
+
+    await bridge._record_pass()
     assert twilio.marks() == []
     await bridge._finisher
 
@@ -200,13 +239,32 @@ async def test_a_caller_who_carries_on_talking_is_not_hung_up_on(monkeypatch):
     monkeypatch.setattr(gptlive, "FAREWELL_START_S", 0.0)
     monkeypatch.setattr(gptlive, "FAREWELL_QUIET_S", 0.2)
     bridge, twilio, _ = make_bridge(monkeypatch, [])
-
-    await bridge._dispatch_tool(
-        _tool_call("end_call", {"reason": "message_taken"})["response"]["item"]
+    record_keeper(
+        monkeypatch, bridge, _calls(("end_call", {"reason": "message_taken"}))
     )
+
+    await bridge._record_pass()
     bridge._handle_caller_transcript("oh, one more thing")
     await bridge._finisher
 
     assert twilio.marks() == []
     assert bridge._ending is False
     assert bridge._record.end_reason == ""
+
+
+@pytest.mark.anyio
+async def test_a_message_is_recovered_after_the_caller_hangs_up(monkeypatch):
+    bridge, _, live = make_bridge(monkeypatch, [])
+    bridge._started -= 30
+    bridge._handle_caller_transcript("It's Dave about the boiler")
+    asked = record_keeper(
+        monkeypatch,
+        bridge,
+        _calls(("take_message", {"caller_name": "Dave", "reason": "boiler"})),
+    )
+
+    await bridge._extract_message_if_missing()
+
+    assert asked[0]["tool_choice"] == "required"
+    assert bridge._record.message_taken
+    assert live.of_type("session.close") == [{"type": "session.close"}]
