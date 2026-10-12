@@ -267,3 +267,14 @@ def test_the_two_bridges_are_interchangeable_from_the_server_s_point_of_view(env
         for attribute in ("run", "transfer_requested", "transfer_reason",
                           "provider_name", "is_outbound"):
             assert hasattr(bridge, attribute), (bridge.__name__, attribute)
+
+
+def test_health_names_the_provider_chosen_in_settings(env, tmp_path):
+    """The wizard writes the provider to settings.json, not `.env`. What is
+    reported has to follow what will actually answer."""
+    cfg = env(VOICE_PROVIDER="openai", OPENAI_API_KEY="sk-x")
+    cfg.settings.save({"behaviour": {"voice_provider": "gpt-live"}})
+
+    assert cfg.config.voice_provider == "gpt-live"
+    assert cfg.config.voice_model == "gpt-live-1+gpt-6-luna"
+    assert cfg.config.provider_ready("gpt-live") == (True, "")

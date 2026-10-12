@@ -29,6 +29,7 @@ without a restart.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -273,6 +274,14 @@ class LiveConfig:
 
     def __getattr__(self, name: str):
         base = object.__getattribute__(self, "_base")
+        # Anything computed - `voice_model`, `provider_ready` - is worked out
+        # against this object, not the frozen one. Otherwise a provider chosen in
+        # the wizard answers the phone while `/health` names the one in `.env`.
+        computed = getattr(type(base), name, None)
+        if isinstance(computed, property):
+            return computed.fget(self)
+        if inspect.isfunction(computed):
+            return computed.__get__(self)
         value = getattr(base, name)
         if name in BEHAVIOUR_KEYS:
             return object.__getattribute__(self, "_settings").behaviour(name, value)
