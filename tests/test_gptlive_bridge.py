@@ -190,3 +190,23 @@ async def test_end_call_hangs_up_only_after_the_goodbye(monkeypatch):
 
     assert "goodbye" in live.of_type("session.instructions.append")[0]["content"]
     assert twilio.marks() == [FINAL_MARK]
+
+
+@pytest.mark.anyio
+async def test_a_caller_who_carries_on_talking_is_not_hung_up_on(monkeypatch):
+    """The record-keeper judges "they have finished" from a transcript, a few
+    seconds late. Anything said before the line drops calls the hang-up off."""
+    monkeypatch.setattr(gptlive, "CALLER_DONE_QUIET_S", 0.0)
+    monkeypatch.setattr(gptlive, "FAREWELL_START_S", 0.0)
+    monkeypatch.setattr(gptlive, "FAREWELL_QUIET_S", 0.2)
+    bridge, twilio, _ = make_bridge(monkeypatch, [])
+
+    await bridge._dispatch_tool(
+        _tool_call("end_call", {"reason": "message_taken"})["response"]["item"]
+    )
+    bridge._handle_caller_transcript("oh, one more thing")
+    await bridge._finisher
+
+    assert twilio.marks() == []
+    assert bridge._ending is False
+    assert bridge._record.end_reason == ""
